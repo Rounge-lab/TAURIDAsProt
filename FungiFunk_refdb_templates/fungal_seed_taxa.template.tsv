@@ -1,0 +1,45 @@
+# ==============================================================================
+# FungiFunk_refdb taxonomic inclusion template
+# ==============================================================================
+
+# Rules:
+#   - Higher taxa use Include_descendants=TRUE.
+#   - Explicit species use Include_descendants=FALSE.
+#   - Taxid="." asks FungiFunk to resolve the current NCBI Taxonomy ID.
+#   - Tier must be 1, 2, or 3.
+#
+# Tier interpretation:
+#   Tier 1 = established yeast / yeast-like fungal lineages.
+#   Tier 2 = microscopic/dimorphic fungal groups with strong target relevance,
+#            including human-associated or human-gut-relevant members.
+#   Tier 3 = other microscopic fungi retained for biological/ecological
+#            plausibility despite limited direct human-gut evidence.
+#
+# IMPORTANT:
+#   A Tier assigned to a higher taxon is a default inherited by descendant
+#   species unless a more specific seed rule overrides it.
+#
+# Precedence:
+#   explicit species Tier
+#       >
+#   most specific matching seed taxon
+#       >
+#   broader matching seed taxon
+#
+# Evidence_type is metadata and does NOT control inclusion by itself.
+#
+# Blank lines and lines beginning with # are ignored.
+# ==============================================================================
+
+Taxon_name	Taxid	Include_descendants	Tier	Evidence_type	Reference	Notes
+Saccharomycotina	.	TRUE	1	established_yeast_lineage	.	Broad inclusion of budding yeasts and allies; covers the modern multi-class Saccharomycotina rather than the former narrow Saccharomycetes concept.
+Schizosaccharomycetes	.	TRUE	1	established_yeast_lineage	.	Fission yeasts and close relatives.
+Malasseziomycetes	.	TRUE	1	established_yeast_lineage;target_relevance	.	Yeast-rich lineage containing Malassezia and related taxa.
+
+Wallemiomycetes	.	TRUE	2	target_relevance	.	Xerophilic basidiomycete lineage retained because of its biological and potential human-associated relevance.
+Dothideomycetes	.	TRUE	2	target_relevance	.	Broad microscopic ascomycete class containing multiple medically and environmentally relevant fungi; inclusion does not imply gut evidence for every descendant.
+Eurotiomycetes	.	TRUE	2	target_relevance	.	Broad class containing many medically relevant molds and black yeasts; inclusion does not imply human evidence for every descendant.
+
+Taphrinomycetes	.	TRUE	3	ecological_plausibility	.	Microscopic/dimorphic ascomycetes retained for sensitivity despite limited direct human-gut evidence.
+Exobasidiomycetes	.	TRUE	3	ecological_plausibility	.	Primarily microscopic plant-associated basidiomycetes retained as biologically plausible non-macrofungal diversity.
+Ustilaginomycetes	.	TRUE	3	ecological_plausibility	.	Microscopic smut-fungal lineage with yeast-like stages in multiple taxa; retained for sensitivity.

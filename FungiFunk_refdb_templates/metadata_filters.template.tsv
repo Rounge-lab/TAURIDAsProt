@@ -1,0 +1,184 @@
+# ==============================================================================
+# FungiFunk_refdb metadata filters template
+# ==============================================================================
+#
+# IMPORTANT:
+#   All ACTIVE rules are combined using AND.
+#
+# Therefore:
+#
+#   Sequencing_technology contains illumina
+#   Sequencing_technology contains pacbio
+#
+# means:
+#
+#   contains illumina AND contains pacbio
+#
+# and is useful, for example, for requiring metadata describing hybrid
+# Illumina + PacBio sequencing.
+#
+# Missing-data behavior:
+#   - If no active rule needs a field, missing metadata has no effect.
+#   - If an active rule requires a field and that field is missing,
+#     the entity FAILS that filter.
+#
+# Text matching:
+#   - Case-insensitive by default.
+#   - Set Case_sensitive=TRUE to require exact capitalization.
+#
+# Supported levels:
+#   species
+#   assembly
+#
+# Supported operators:
+#   present
+#   absent
+#   contains
+#   not_contains
+#   equals
+#   not_equals
+#   starts_with
+#   ends_with
+#   min
+#   max
+#   after
+#   before
+#
+# Supported species fields:
+#   Taxon_name
+#   Taxid
+#   Phylum
+#   Class
+#   Order
+#   Family
+#   Genus
+#   Authority
+#   Tier
+#   Explicit_include
+#   Evidence_type
+#   Reference
+#   Notes
+#   Gut_evidence
+#   Human_evidence
+#   Seed_taxa
+#   Tier_source
+#
+# Supported assembly fields:
+#   Assembly_accession
+#   Assembly_source
+#   Paired_accession
+#   Assembly_status
+#   Atypical
+#   Atypical_warnings
+#   Multi_isolate
+#   Assembly_level
+#   RefSeq_category
+#   Strain
+#   Isolate
+#   Infraspecific_name
+#   BioProject
+#   BioSample
+#   Assembly_method
+#   Sequencing_technology
+#   Contig_N50
+#   Contig_L50
+#   Num_contigs
+#   Scaffold_N50
+#   Scaffold_L50
+#   Num_scaffolds
+#   Num_scaffold_gaps
+#   Genome_size
+#   GC_percent
+#   Protein_coding_genes
+#   BUSCO_complete
+#   BUSCO_fragmented
+#   BUSCO_missing
+#   BUSCO_duplicated
+#   Release_date
+#   Annotation_name
+#   Annotation_release_date
+#   Annotation_status
+#   Protein_FASTA_available
+#
+# NOTE ABOUT THE ACTIVE DEFAULT ROW:
+#   The current Python parser requires at least one active row when a
+#   --metadata-filters file is supplied.
+#
+#   "species Taxon_name present" is therefore included as a deliberate no-op.
+#   It does not restrict a normally resolved FungiFunk species set.
+#
+# Blank lines and lines beginning with # are ignored.
+# ==============================================================================
+
+Level	Field	Operator	Value	Case_sensitive	Notes
+species	Taxon_name	present	.	.	DEFAULT_NO_OP: keeps all normally resolved species while allowing this file to be supplied unchanged.
+
+# ------------------------------------------------------------------------------
+# EXAMPLES - COMMENTED OUT AND THEREFORE INACTIVE
+# ------------------------------------------------------------------------------
+
+# Require a nomenclatural Authority value.
+# This does NOT mean that FungiFunk interprets Authority as publication evidence.
+# species	Authority	present	.	.	Require NCBI nomenclatural authority metadata.
+
+# Restrict to a specific genus.
+# species	Genus	equals	Candida	FALSE	Example genus-level metadata restriction.
+
+# Keep only Tier 1 species.
+# species	Tier	equals	1	.	Example Tier restriction.
+
+# Require both Illumina and PacBio to occur in the sequencing-technology field.
+# assembly	Sequencing_technology	contains	illumina	FALSE	Require Illumina metadata.
+# assembly	Sequencing_technology	contains	pacbio	FALSE	Require PacBio metadata as well.
+
+# Case-sensitive example.
+# assembly	Assembly_method	contains	SPAdes	TRUE	Require this exact capitalization.
+
+# Contiguity examples.
+# assembly	Contig_N50	min	50000	.	Require Contig N50 >= 50 kb.
+# assembly	Contig_L50	max	100	.	Require Contig L50 <= 100.
+# assembly	Num_contigs	max	1000	.	Require no more than 1000 contigs.
+
+# Scaffold examples.
+# assembly	Scaffold_N50	min	100000	.	Require Scaffold N50 >= 100 kb.
+# assembly	Scaffold_L50	max	50	.	Require Scaffold L50 <= 50.
+# assembly	Num_scaffolds	max	500	.	Require no more than 500 scaffolds.
+# assembly	Num_scaffold_gaps	max	1000	.	Example gap-count restriction.
+
+# Genome-size window.
+# These two rows are ANDed, producing a closed interval.
+# assembly	Genome_size	min	5000000	.	Genome size must be >= 5 Mb.
+# assembly	Genome_size	max	100000000	.	Genome size must be <= 100 Mb.
+
+# GC window.
+# assembly	GC_percent	min	20	.	GC percentage must be >= 20.
+# assembly	GC_percent	max	80	.	GC percentage must be <= 80.
+
+# Annotation/gene count.
+# assembly	Protein_coding_genes	min	3000	.	Require at least 3000 protein-coding genes.
+
+# BUSCO examples.
+# Missing BUSCO metadata fails any active BUSCO rule.
+# assembly	BUSCO_complete	min	90	.	Require BUSCO complete >= 90 percent.
+# assembly	BUSCO_missing	max	10	.	Require BUSCO missing <= 10 percent.
+# assembly	BUSCO_fragmented	max	10	.	Require BUSCO fragmented <= 10 percent.
+# assembly	BUSCO_duplicated	max	20	.	Require BUSCO duplicated <= 20 percent.
+
+# Assembly level.
+# assembly	Assembly_level	equals	Complete Genome	FALSE	Keep complete genome assemblies only.
+
+# Release-date window.
+# assembly	Release_date	after	2020-01-01	.	Released on or after 2020-01-01.
+# assembly	Release_date	before	2026-12-31	.	Released on or before 2026-12-31.
+
+# RefSeq category.
+# assembly	RefSeq_category	equals	reference genome	FALSE	Require RefSeq reference-genome category.
+
+# Presence/absence examples.
+# assembly	Strain	present	.	.	Require strain metadata.
+# assembly	Isolate	present	.	.	Require isolate metadata.
+# assembly	BioSample	present	.	.	Require BioSample accession.
+
+# Negative text examples.
+# assembly	Assembly_method	not_contains	example_text	FALSE	Example exclusion based on assembly-method text.
+# assembly	Sequencing_technology	not_contains	example_text	FALSE	Example exclusion based on sequencing-technology text.

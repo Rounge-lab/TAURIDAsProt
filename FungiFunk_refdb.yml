@@ -1,0 +1,9 @@
+name: FungiFunk_refdb
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - ncbi-datasets-cli=18.38.0
+  - psutil
+  - openpyxl
