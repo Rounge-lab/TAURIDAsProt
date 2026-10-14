@@ -13,7 +13,7 @@ TEMPLATE_DIR="${script_dir}/FungiFunk_refdb_templates"
 
 # Define the name, version and final output file of the tool
 TOOL_NAME="FungiFunk_refdb"
-VERSION="0.1.8"
+VERSION="0.2.0"
 FINAL_FASTA_NAME="FungiFunk_protein_refdb.faa"
 
 # Internal paths used by FungiFunk_refdb
@@ -231,6 +231,10 @@ Help() {
     echo "Custom species/assembly metadata rules:"
     echo "  --metadata-filters"
     echo ""
+    echo "Explicit strain/assembly targets:"
+    echo "  --include-explicit-targets"
+    echo "  --exclude-explicit-targets"
+    echo ""
     echo "Assembly source/scope:"
     echo "  --include-gca"
     echo "  --include-atypical"
@@ -289,7 +293,9 @@ Help() {
     echo "      supplied in the current command."
     echo ""
     echo "      Required whenever this flag is used:"
-    echo "        --seed-taxa <file>"
+    echo "        at least one of:"
+    echo "          --seed-taxa <file>"
+    echo "          --include-explicit-targets <file>"
     echo ""
     echo "      Valid with:"
     echo "        --create-new-updated-version"
@@ -305,9 +311,11 @@ Help() {
     echo "          configuration is locked for that build."
     echo ""
     echo "      After a reset:"
-    echo "        - --seed-taxa is taken from the supplied file"
+    echo "        - supplied --seed-taxa is taken from the supplied file"
+    echo "        - supplied --include-explicit-targets is taken from the supplied file"
     echo "        - omitted --exclude-taxa means no explicit taxonomic exclusions"
     echo "        - omitted --metadata-filters means no custom metadata-filter TSV"
+    echo "        - omitted --exclude-explicit-targets means no explicit target exclusions"
     echo "        - omitted biological booleans return to false"
     echo "        - omitted named QC/filter values return to their clean defaults"
     echo ""
@@ -324,9 +332,8 @@ Help() {
     echo "  --seed-taxa <file>"
     echo "      Seed taxa and explicit species inclusion TSV."
     echo ""
-    echo "      Required for:"
-    echo "        --create"
-    echo "        any use of --reset-biological-config"
+    echo "      For --create and --reset-biological-config, at least one of"
+    echo "      --seed-taxa or --include-explicit-targets is required."
     echo ""
     echo "      Optional for updates without --reset-biological-config."
     echo "      If omitted, the source reference's stored seed snapshot is inherited."
@@ -381,6 +388,50 @@ Help() {
     echo ""
     echo "      Template:"
     echo "        ${TEMPLATE_DIR}/metadata_filters.template.tsv"
+    echo ""
+    echo "  --include-explicit-targets <file>"
+    echo "      Explicit strain/assembly inclusion-target TSV."
+    echo ""
+    echo "      Supported target types:"
+    echo "        strain"
+    echo "          Requires Strain and at least one of Species or Taxid."
+    echo "          FungiFunk selects the best usable eligible assembly for that strain."
+    echo ""
+    echo "        assembly"
+    echo "          Requires an exact versioned GCF/GCA accession."
+    echo "          Species, Taxid and Strain may be supplied as identity hints and are"
+    echo "          validated against the resolved NCBI record."
+    echo ""
+    echo "      Explicit inclusions are additional to the normal automatic selection"
+    echo "      limits. They do not consume automatic strain/assembly quota."
+    echo ""
+    echo "      An exact explicitly requested GCA may be admitted without globally"
+    echo "      enabling --include-gca. This exception applies only to that target."
+    echo ""
+    echo "      May be supplied with --create, update modes, or a pre-assembly --resume."
+    echo "      With --create or --reset-biological-config, it may satisfy the primary"
+    echo "      inclusion requirement instead of --seed-taxa."
+    echo ""
+    echo "      Not changeable after ASSEMBLY_SEARCH_AND_SELECTION has started."
+    echo ""
+    echo "      Template shared with --exclude-explicit-targets:"
+    echo "        ${TEMPLATE_DIR}/explicit_targets.template.tsv"
+    echo ""
+    echo "      Use separate TSV files for inclusions and exclusions when both options"
+    echo "      are needed."
+    echo ""
+    echo "  --exclude-explicit-targets <file>"
+    echo "      Explicit strain/assembly exclusion-target TSV."
+    echo ""
+    echo "      Uses the same target schema and template as --include-explicit-targets."
+    echo "      Matching assemblies/strains cannot be selected and do not consume"
+    echo "      automatic selection quota."
+    echo ""
+    echo "      Optional biological input."
+    echo "      It cannot by itself satisfy the inclusion requirement for --create or"
+    echo "      --reset-biological-config."
+    echo ""
+    echo "      Not changeable after ASSEMBLY_SEARCH_AND_SELECTION has started."
     echo ""
     echo "Paths and identifiers:"
     echo ""
@@ -1037,6 +1088,24 @@ Help() {
     echo "  applied."
     echo ""
     echo ""
+    echo "-> Re-create a reference from the exact selected-assembly targets of a"
+    echo "   previously completed reference:"
+    echo ""
+    echo "  ${TOOL_NAME}.sh \\"
+    echo "      --create \\"
+    echo "      --outdir reproduced_refdb \\"
+    echo "      --include-explicit-targets \\"
+    echo "          previous_refdb/metadata/reproduction_targets.tsv"
+    echo ""
+    echo "  metadata/reproduction_targets.tsv is generated automatically in every"
+    echo "  completed reference. It contains one exact versioned assembly target for"
+    echo "  each final selected assembly."
+    echo ""
+    echo "  This requests the same selected assembly accessions without requiring a"
+    echo "  seed-taxonomy file. Successful representation still depends on the target"
+    echo "  assemblies remaining retrievable and usable."
+    echo ""
+    echo ""
     echo "-> Create a new updated version while inheriting the previous configuration:"
     echo ""
     echo "  ${TOOL_NAME}.sh \\"
@@ -1079,6 +1148,11 @@ Help() {
     echo "  Exact duplicate proteins are stored once in the final FASTA, while all original"
     echo "  species, assembly, strain and protein origins are retained in provenance metadata."
     echo ""
+    echo "  Every completed reference also contains:"
+    echo "    metadata/reproduction_targets.tsv"
+    echo "  This records the exact versioned assemblies selected into the final reference"
+    echo "  using the same schema accepted by --include-explicit-targets."
+    echo ""
     echo "  Taxonomic Tier is metadata and does not create separate reference databases."
     echo ""
     echo "  Custom filters are optional. No numerical N50/BUSCO/genome-size threshold is"
@@ -1105,6 +1179,8 @@ SOURCE_REFDB=""
 SEED_TAXA=""
 EXCLUDE_TAXA=""
 METADATA_FILTERS=""
+INCLUDE_EXPLICIT_TARGETS=""
+EXCLUDE_EXPLICIT_TARGETS=""
 TMPDIR_ARG=""
 DB_VERSION_LABEL=""
 
@@ -1495,6 +1571,18 @@ while [[ "$#" -gt 0 ]]; do
             CURATION_INPUT_OPTIONS_SEEN+=("--metadata-filters")
             shift 2
             ;;
+        --include-explicit-targets)
+            require_value "$1" "$#"
+            INCLUDE_EXPLICIT_TARGETS="$2"
+            CURATION_INPUT_OPTIONS_SEEN+=("--include-explicit-targets")
+            shift 2
+            ;;
+        --exclude-explicit-targets)
+            require_value "$1" "$#"
+            EXCLUDE_EXPLICIT_TARGETS="$2"
+            CURATION_INPUT_OPTIONS_SEEN+=("--exclude-explicit-targets")
+            shift 2
+            ;;
         --tmpdir)
             require_value "$1" "$#"
             TMPDIR_ARG="$2"
@@ -1637,6 +1725,8 @@ fi
 [[ -z "$SEED_TAXA" ]] || check_readable_file "--seed-taxa" "$SEED_TAXA"
 [[ -z "$EXCLUDE_TAXA" ]] || check_readable_file "--exclude-taxa" "$EXCLUDE_TAXA"
 [[ -z "$METADATA_FILTERS" ]] || check_readable_file "--metadata-filters" "$METADATA_FILTERS"
+[[ -z "$INCLUDE_EXPLICIT_TARGETS" ]] || check_readable_file "--include-explicit-targets" "$INCLUDE_EXPLICIT_TARGETS"
+[[ -z "$EXCLUDE_EXPLICIT_TARGETS" ]] || check_readable_file "--exclude-explicit-targets" "$EXCLUDE_EXPLICIT_TARGETS"
 
 
 ########################################################################################################
@@ -1649,8 +1739,8 @@ case "$RUN_MODE" in
             exit 2
         fi
 
-        if [[ -z "$SEED_TAXA" ]]; then
-            log_msg "[ERROR] --create requires --seed-taxa FILE." >&2
+        if [[ -z "$SEED_TAXA" && -z "$INCLUDE_EXPLICIT_TARGETS" ]]; then
+            log_msg "[ERROR] --create requires at least one of --seed-taxa FILE or --include-explicit-targets FILE." >&2
             exit 2
         fi
 
@@ -1702,8 +1792,8 @@ case "$RUN_MODE" in
         require_completed_refdb_skeleton "$SOURCE_REFDB_CANON" "--source-refdb"
 
         if [[ "$RESET_BIOLOGICAL_CONFIG" == true ]]; then
-            if [[ -z "$SEED_TAXA" ]]; then
-                log_msg "[ERROR] --reset-biological-config requires --seed-taxa FILE." >&2
+            if [[ -z "$SEED_TAXA" && -z "$INCLUDE_EXPLICIT_TARGETS" ]]; then
+                log_msg "[ERROR] --reset-biological-config requires at least one of --seed-taxa FILE or --include-explicit-targets FILE." >&2
                 exit 2
             fi
         fi
@@ -1720,8 +1810,8 @@ case "$RUN_MODE" in
         require_completed_refdb_skeleton "$OUTDIR_CANON" "--overwrite-with-updated-version target"
 
         if [[ "$RESET_BIOLOGICAL_CONFIG" == true ]]; then
-            if [[ -z "$SEED_TAXA" ]]; then
-                log_msg "[ERROR] --reset-biological-config requires --seed-taxa FILE." >&2
+            if [[ -z "$SEED_TAXA" && -z "$INCLUDE_EXPLICIT_TARGETS" ]]; then
+                log_msg "[ERROR] --reset-biological-config requires at least one of --seed-taxa FILE or --include-explicit-targets FILE." >&2
                 exit 2
             fi
         fi

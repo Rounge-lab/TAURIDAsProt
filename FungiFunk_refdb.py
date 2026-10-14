@@ -46,7 +46,7 @@ except ImportError:
 ########################################################################################################
 
 TOOL_NAME = "FungiFunk_refdb"
-VERSION = "0.1.6"
+VERSION = "0.2.0"
 FINAL_FASTA_NAME = "FungiFunk_protein_refdb.faa"
 
 ESTIMATED_RAM_GIB_PER_WORKER = 1.0
@@ -108,6 +108,12 @@ CONFIG_JSON_REL = Path(STATE_DIR) / "resolved_config.json"
 SEED_SNAPSHOT = "fungal_seed_taxa.tsv"
 EXCLUSION_SNAPSHOT = "fungal_exclusion_taxa.tsv"
 FILTER_SNAPSHOT = "metadata_filters.tsv"
+INCLUDE_EXPLICIT_TARGETS_SNAPSHOT = "include_explicit_targets.tsv"
+EXCLUDE_EXPLICIT_TARGETS_SNAPSHOT = "exclude_explicit_targets.tsv"
+RESOLVED_EXPLICIT_TARGETS_JSON = "explicit_targets_resolved.json"
+RESOLVED_EXPLICIT_TARGETS_SCHEMA_VERSION = 1
+
+REPRODUCTION_TARGETS_TSV = "reproduction_targets.tsv"
 
 # Run modes
 RUN_MODES = {
@@ -1281,6 +1287,8 @@ class BuildConfig:
     seed_taxa: str | None = None
     exclude_taxa: str | None = None
     metadata_filters: str | None = None
+    include_explicit_targets: str | None = None
+    exclude_explicit_targets: str | None = None
     tmpdir: str | None = None
     db_version: str | None = None
     workers: str | int = "auto"
@@ -1388,6 +1396,8 @@ BIOLOGICAL_INPUT_ARG_FIELDS = {
     "seed_taxa",
     "exclude_taxa",
     "metadata_filters",
+    "include_explicit_targets",
+    "exclude_explicit_targets",
 }
 
 
@@ -1605,6 +1615,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed-taxa")
     p.add_argument("--exclude-taxa")
     p.add_argument("--metadata-filters")
+    p.add_argument(
+        "--include-explicit-targets",
+        metavar="FILE",
+        help=(
+            "TSV of explicit strain or exact assembly inclusion targets. "
+            "Targets are additional to ordinary automatic selection limits. "
+            "May be used without --seed-taxa to drive a target-only create."
+        ),
+    )
+    p.add_argument(
+        "--exclude-explicit-targets",
+        metavar="FILE",
+        help=(
+            "TSV of explicit strain or exact assembly exclusion targets. "
+            "Excluded targets cannot be selected and do not consume automatic "
+            "selection quota."
+        ),
+    )
     p.add_argument("--tmpdir")
     p.add_argument("--db-version")
     p.add_argument(
@@ -1614,9 +1642,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Discard inherited biological configuration, "
             "restore clean defaults, and then apply the biological options supplied "
-            "in the current command. Requires --seed-taxa. Available for update "
-            "modes; pre-assembly resume support is validated from persistent build "
-            "state."
+            "in the current command. Requires at least one of --seed-taxa or "
+            "--include-explicit-targets. Available for update modes; pre-assembly "
+            "resume support is validated from persistent build state."
         ),
     )
     p.add_argument("--workers", default=None)
@@ -2019,9 +2047,10 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
                 "--create already starts from clean biological defaults."
             )
 
-        if not ns.seed_taxa:
+        if not ns.seed_taxa and not ns.include_explicit_targets:
             raise ConfigError(
-                "--create requires --seed-taxa."
+                "--create requires at least one of --seed-taxa or "
+                "--include-explicit-targets."
             )
 
         base: dict[str, Any] = {}
@@ -2109,9 +2138,11 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
         }
         and reset_biological_config
         and not ns.seed_taxa
+        and not ns.include_explicit_targets
     ):
         raise ConfigError(
-            "--reset-biological-config requires --seed-taxa."
+            "--reset-biological-config requires at least one of "
+            "--seed-taxa or --include-explicit-targets."
         )
 
     # Build from explicit defaults, then apply inherited values, then explicit
@@ -2270,6 +2301,8 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
     resolved["seed_taxa"] = ns.seed_taxa
     resolved["exclude_taxa"] = ns.exclude_taxa
     resolved["metadata_filters"] = ns.metadata_filters
+    resolved["include_explicit_targets"] = ns.include_explicit_targets
+    resolved["exclude_explicit_targets"] = ns.exclude_explicit_targets
 
     # Normalize unset booleans after inheritance/default composition.
     for name in [
@@ -2826,6 +2859,8 @@ def _render_biological_config_for_wrapper_log(
     seed_snapshot: Path | None,
     exclusion_snapshot: Path | None,
     filter_snapshot: Path | None,
+    include_explicit_targets_snapshot: Path | None,
+    exclude_explicit_targets_snapshot: Path | None,
 ) -> list[str]:
     """Render one inherited/effective biological configuration."""
 
@@ -2833,7 +2868,7 @@ def _render_biological_config_for_wrapper_log(
 
     lines.extend(
         [
-            "  Taxon / metadata inputs:",
+            "  Biological input snapshots:",
             (
                 "    seed_taxa: "
                 + (
@@ -2855,6 +2890,22 @@ def _render_biological_config_for_wrapper_log(
                 + (
                     str(filter_snapshot)
                     if filter_snapshot is not None
+                    else "none"
+                )
+            ),
+            (
+                "    include_explicit_targets: "
+                + (
+                    str(include_explicit_targets_snapshot)
+                    if include_explicit_targets_snapshot is not None
+                    else "none"
+                )
+            ),
+            (
+                "    exclude_explicit_targets: "
+                + (
+                    str(exclude_explicit_targets_snapshot)
+                    if exclude_explicit_targets_snapshot is not None
                     else "none"
                 )
             ),
@@ -2972,10 +3023,12 @@ def append_wrapper_command_and_inherited_biological_config(
             )
         ),
         "",
-        "  Taxon / metadata inputs:",
+        "  Biological inputs:",
         f"    seed_taxa: {ns.seed_taxa or 'not supplied'}",
         f"    exclude_taxa: {ns.exclude_taxa or 'not supplied'}",
         f"    metadata_filters: {ns.metadata_filters or 'not supplied'}",
+        f"    include_explicit_targets: {ns.include_explicit_targets or 'not supplied'}",
+        f"    exclude_explicit_targets: {ns.exclude_explicit_targets or 'not supplied'}",
         "",
     ]
 
@@ -3140,9 +3193,34 @@ def append_wrapper_command_and_inherited_biological_config(
             else None
         )
 
+        inherited_include_explicit_candidate = (
+            inherited_root
+            / CONFIG_DIR
+            / INCLUDE_EXPLICIT_TARGETS_SNAPSHOT
+        )
+
+        inherited_include_explicit = (
+            inherited_include_explicit_candidate
+            if inherited_include_explicit_candidate.is_file()
+            else None
+        )
+
+        inherited_exclude_explicit_candidate = (
+            inherited_root
+            / CONFIG_DIR
+            / EXCLUDE_EXPLICIT_TARGETS_SNAPSHOT
+        )
+
+        inherited_exclude_explicit = (
+            inherited_exclude_explicit_candidate
+            if inherited_exclude_explicit_candidate.is_file()
+            else None
+        )
+
         lines.append(
             f"  source: {inherited_root}"
         )
+        
         lines.append("")
 
         lines.extend(
@@ -3151,6 +3229,8 @@ def append_wrapper_command_and_inherited_biological_config(
                 seed_snapshot=inherited_seed,
                 exclusion_snapshot=inherited_exclusion,
                 filter_snapshot=inherited_filter,
+                include_explicit_targets_snapshot=inherited_include_explicit,
+                exclude_explicit_targets_snapshot=inherited_exclude_explicit,
             )
         )
 
@@ -3176,6 +3256,8 @@ def append_wrapper_effective_biological_config(
     seed_snapshot: Path,
     exclusion_snapshot: Path,
     filter_snapshot: Path | None,
+    include_explicit_targets_snapshot: Path | None,
+    exclude_explicit_targets_snapshot: Path | None,
 ) -> None:
     """Log the biological configuration actually used by this invocation."""
 
@@ -3198,6 +3280,8 @@ def append_wrapper_effective_biological_config(
             seed_snapshot=seed_snapshot,
             exclusion_snapshot=exclusion_snapshot,
             filter_snapshot=filter_snapshot,
+            include_explicit_targets_snapshot=include_explicit_targets_snapshot,
+            exclude_explicit_targets_snapshot=exclude_explicit_targets_snapshot,
         )
     )
 
@@ -3224,17 +3308,61 @@ def copy_config_snapshot(source: Path, destination: Path) -> None:
     atomic_replace(part, destination)
 
 
-def resolve_config_snapshots(config: BuildConfig, work_root: Path, source_root: Path | None, state: StateDB) -> tuple[Path, Path, Path | None]:
+def resolve_config_snapshots(
+    config: BuildConfig,
+    work_root: Path,
+    source_root: Path | None,
+    state: StateDB,
+) -> tuple[
+    Path,
+    Path,
+    Path | None,
+    Path | None,
+    Path | None,
+]:
     """Select/copy the exact biological TSV snapshots used by this build.
 
-    This is the authoritative implementation of the update inheritance policy.
-    The resulting files always live under work_root/config so future updates are
+    The resulting files live under work_root/config so future updates remain
     reproducible even if the user's original files move or disappear.
+
+    A seed snapshot always exists. For explicit-target-only builds it is a valid
+    header-only TSV representing an empty automatic seed set.
+
+    Explicit-target snapshots are optional: absence means that no corresponding
+    explicit inclusion/exclusion target file is active.
     """
+
     config_dir = work_root / CONFIG_DIR
+
     seed_dst = config_dir / SEED_SNAPSHOT
     exc_dst = config_dir / EXCLUSION_SNAPSHOT
     filt_dst = config_dir / FILTER_SNAPSHOT
+
+    include_explicit_dst = (
+        config_dir
+        / INCLUDE_EXPLICIT_TARGETS_SNAPSHOT
+    )
+
+    exclude_explicit_dst = (
+        config_dir
+        / EXCLUDE_EXPLICIT_TARGETS_SNAPSHOT
+    )
+
+    def remove_optional_snapshot(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+
+    def copy_optional_or_remove(
+        supplied_path: str | None,
+        destination: Path,
+    ) -> None:
+        if supplied_path:
+            copy_config_snapshot(
+                Path(supplied_path),
+                destination,
+            )
+        else:
+            remove_optional_snapshot(destination)
 
     if config.run_mode == "resume":
 
@@ -3254,49 +3382,70 @@ def resolve_config_snapshots(config: BuildConfig, work_root: Path, source_root: 
                     "search and selection has already started for this build."
                 )
 
-            if not config.seed_taxa:
+            if not config.seed_taxa and not config.include_explicit_targets:
                 raise ConfigError(
-                    "--reset-biological-config with --resume requires "
-                    "--seed-taxa FILE."
+                    "--reset-biological-config with --resume requires at least "
+                    "one of --seed-taxa FILE or --include-explicit-targets FILE."
                 )
 
-            copy_config_snapshot(
-                Path(config.seed_taxa),
-                seed_dst,
-            )
+            if config.seed_taxa:
+                copy_config_snapshot(
+                    Path(config.seed_taxa),
+                    seed_dst,
+                )
+            else:
+                write_empty_seed_snapshot(
+                    seed_dst,
+                )
 
             if config.exclude_taxa:
-
                 copy_config_snapshot(
                     Path(config.exclude_taxa),
                     exc_dst,
                 )
-
             else:
-
                 write_empty_exclusion_snapshot(
                     exc_dst,
                 )
 
             if config.metadata_filters:
-
                 copy_config_snapshot(
                     Path(config.metadata_filters),
                     filt_dst,
                 )
+            else:
+                remove_optional_snapshot(
+                    filt_dst,
+                )
 
-            elif filt_dst.exists():
+            copy_optional_or_remove(
+                config.include_explicit_targets,
+                include_explicit_dst,
+            )
 
-                filt_dst.unlink()
+            copy_optional_or_remove(
+                config.exclude_explicit_targets,
+                exclude_explicit_dst,
+            )
 
             return (
                 seed_dst,
                 exc_dst,
                 filt_dst if filt_dst.is_file() else None,
+                (
+                    include_explicit_dst
+                    if include_explicit_dst.is_file()
+                    else None
+                ),
+                (
+                    exclude_explicit_dst
+                    if exclude_explicit_dst.is_file()
+                    else None
+                ),
             )
 
         # Normal pre-assembly resume may replace selected biological TSVs while
-        # preserving all biological inputs that were not supplied explicitly.
+        # preserving biological inputs that were not supplied explicitly.
         if config.seed_taxa:
 
             if not biological_editable:
@@ -3348,21 +3497,67 @@ def resolve_config_snapshots(config: BuildConfig, work_root: Path, source_root: 
                 filt_dst,
             )
 
+        if config.include_explicit_targets:
+
+            if not biological_editable:
+                raise ConfigError(
+                    "--include-explicit-targets cannot be changed because "
+                    "assembly search and selection has already started for this "
+                    "build."
+                )
+
+            copy_config_snapshot(
+                Path(config.include_explicit_targets),
+                include_explicit_dst,
+            )
+
+        if config.exclude_explicit_targets:
+
+            if not biological_editable:
+                raise ConfigError(
+                    "--exclude-explicit-targets cannot be changed because "
+                    "assembly search and selection has already started for this "
+                    "build."
+                )
+
+            copy_config_snapshot(
+                Path(config.exclude_explicit_targets),
+                exclude_explicit_dst,
+            )
+
         return (
             seed_dst,
             exc_dst,
             filt_dst if filt_dst.is_file() else None,
+            (
+                include_explicit_dst
+                if include_explicit_dst.is_file()
+                else None
+            ),
+            (
+                exclude_explicit_dst
+                if exclude_explicit_dst.is_file()
+                else None
+            ),
         )
-
 
     if config.run_mode == "create":
 
-        assert config.seed_taxa
+        if config.seed_taxa:
+            copy_config_snapshot(
+                Path(config.seed_taxa),
+                seed_dst,
+            )
+        else:
+            if not config.include_explicit_targets:
+                raise ConfigError(
+                    "--create requires at least one of --seed-taxa or "
+                    "--include-explicit-targets."
+                )
 
-        copy_config_snapshot(
-            Path(config.seed_taxa),
-            seed_dst,
-        )
+            write_empty_seed_snapshot(
+                seed_dst,
+            )
 
         if config.exclude_taxa:
             copy_config_snapshot(
@@ -3379,25 +3574,61 @@ def resolve_config_snapshots(config: BuildConfig, work_root: Path, source_root: 
                 Path(config.metadata_filters),
                 filt_dst,
             )
+        else:
+            remove_optional_snapshot(
+                filt_dst,
+            )
 
-        elif filt_dst.exists():
-            filt_dst.unlink()
+        copy_optional_or_remove(
+            config.include_explicit_targets,
+            include_explicit_dst,
+        )
+
+        copy_optional_or_remove(
+            config.exclude_explicit_targets,
+            exclude_explicit_dst,
+        )
 
         return (
             seed_dst,
             exc_dst,
             filt_dst if filt_dst.is_file() else None,
+            (
+                include_explicit_dst
+                if include_explicit_dst.is_file()
+                else None
+            ),
+            (
+                exclude_explicit_dst
+                if exclude_explicit_dst.is_file()
+                else None
+            ),
         )
 
     # Update modes.
     if source_root is None:
-        raise ConfigError("Internal configuration error: update source is missing.")
-    if config.reset_biological_config:
-        assert config.seed_taxa
-        copy_config_snapshot(
-            Path(config.seed_taxa),
-            seed_dst,
+        raise ConfigError(
+            "Internal configuration error: update source is missing."
         )
+
+    if config.reset_biological_config:
+
+        if config.seed_taxa:
+            copy_config_snapshot(
+                Path(config.seed_taxa),
+                seed_dst,
+            )
+        else:
+            if not config.include_explicit_targets:
+                raise ConfigError(
+                    "--reset-biological-config requires at least one of "
+                    "--seed-taxa or --include-explicit-targets."
+                )
+
+            write_empty_seed_snapshot(
+                seed_dst,
+            )
+
         if config.exclude_taxa:
             copy_config_snapshot(
                 Path(config.exclude_taxa),
@@ -3407,27 +3638,155 @@ def resolve_config_snapshots(config: BuildConfig, work_root: Path, source_root: 
             write_empty_exclusion_snapshot(
                 exc_dst,
             )
+
         if config.metadata_filters:
             copy_config_snapshot(
                 Path(config.metadata_filters),
                 filt_dst,
             )
-        elif filt_dst.exists():
-            filt_dst.unlink()
-    else:
-        seed_src = Path(config.seed_taxa) if config.seed_taxa else source_root / CONFIG_DIR / SEED_SNAPSHOT
-        exc_src = Path(config.exclude_taxa) if config.exclude_taxa else source_root / CONFIG_DIR / EXCLUSION_SNAPSHOT
-        copy_config_snapshot(seed_src, seed_dst)
-        copy_config_snapshot(exc_src, exc_dst)
-        if config.metadata_filters:
-            copy_config_snapshot(Path(config.metadata_filters), filt_dst)
         else:
-            inherited_filter = source_root / CONFIG_DIR / FILTER_SNAPSHOT
+            remove_optional_snapshot(
+                filt_dst,
+            )
+
+        copy_optional_or_remove(
+            config.include_explicit_targets,
+            include_explicit_dst,
+        )
+
+        copy_optional_or_remove(
+            config.exclude_explicit_targets,
+            exclude_explicit_dst,
+        )
+
+    else:
+
+        seed_src = (
+            Path(config.seed_taxa)
+            if config.seed_taxa
+            else source_root / CONFIG_DIR / SEED_SNAPSHOT
+        )
+
+        exc_src = (
+            Path(config.exclude_taxa)
+            if config.exclude_taxa
+            else source_root / CONFIG_DIR / EXCLUSION_SNAPSHOT
+        )
+
+        copy_config_snapshot(
+            seed_src,
+            seed_dst,
+        )
+
+        copy_config_snapshot(
+            exc_src,
+            exc_dst,
+        )
+
+        if config.metadata_filters:
+            copy_config_snapshot(
+                Path(config.metadata_filters),
+                filt_dst,
+            )
+        else:
+            inherited_filter = (
+                source_root
+                / CONFIG_DIR
+                / FILTER_SNAPSHOT
+            )
+
             if inherited_filter.is_file():
-                copy_config_snapshot(inherited_filter, filt_dst)
-            elif filt_dst.exists():
-                filt_dst.unlink()
-    return seed_dst, exc_dst, filt_dst if filt_dst.is_file() else None
+                copy_config_snapshot(
+                    inherited_filter,
+                    filt_dst,
+                )
+            else:
+                remove_optional_snapshot(
+                    filt_dst,
+                )
+
+        if config.include_explicit_targets:
+            copy_config_snapshot(
+                Path(config.include_explicit_targets),
+                include_explicit_dst,
+            )
+        else:
+            inherited_include_explicit = (
+                source_root
+                / CONFIG_DIR
+                / INCLUDE_EXPLICIT_TARGETS_SNAPSHOT
+            )
+
+            if inherited_include_explicit.is_file():
+                copy_config_snapshot(
+                    inherited_include_explicit,
+                    include_explicit_dst,
+                )
+            else:
+                remove_optional_snapshot(
+                    include_explicit_dst,
+                )
+
+        if config.exclude_explicit_targets:
+            copy_config_snapshot(
+                Path(config.exclude_explicit_targets),
+                exclude_explicit_dst,
+            )
+        else:
+            inherited_exclude_explicit = (
+                source_root
+                / CONFIG_DIR
+                / EXCLUDE_EXPLICIT_TARGETS_SNAPSHOT
+            )
+
+            if inherited_exclude_explicit.is_file():
+                copy_config_snapshot(
+                    inherited_exclude_explicit,
+                    exclude_explicit_dst,
+                )
+            else:
+                remove_optional_snapshot(
+                    exclude_explicit_dst,
+                )
+
+    return (
+        seed_dst,
+        exc_dst,
+        filt_dst if filt_dst.is_file() else None,
+        (
+            include_explicit_dst
+            if include_explicit_dst.is_file()
+            else None
+        ),
+        (
+            exclude_explicit_dst
+            if exclude_explicit_dst.is_file()
+            else None
+        ),
+    )
+
+
+def write_empty_seed_snapshot(path: Path) -> None:
+    """Write a valid header-only seed snapshot for explicit-target-only builds.
+
+    This snapshot is created only when no --seed-taxa file was supplied and the
+    build is driven by explicit inclusion targets. A user-supplied empty seed
+    file remains subject to normal seed-input validation.
+    """
+
+    write_tsv(
+        path,
+        [
+            "Taxon_name",
+            "Taxid",
+            "Include_descendants",
+            "Tier",
+            "Evidence_type",
+            "Reference",
+            "Notes",
+        ],
+        [],
+    )
 
 
 def write_empty_exclusion_snapshot(path: Path) -> None:
@@ -3878,6 +4237,74 @@ class NCBIClient:
 
         return parse_json_records(result.stdout)
 
+    def genome_by_accession(
+        self,
+        accession: str,
+        *,
+        exclude_multi_isolate: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return the exact requested versioned assembly record, if available.
+
+        Explicit assembly targets are version-specific. Request all assembly
+        versions from NCBI and then require an exact accession.version match
+        rather than accepting a current or substituted assembly version.
+        """
+
+        requested = accession.strip().upper()
+
+        cmd = [
+            "datasets",
+            "summary",
+            "genome",
+            "accession",
+            requested,
+            "--assembly-version",
+            "all",
+            "--as-json-lines",
+            "--limit",
+            "all",
+        ]
+
+        if exclude_multi_isolate:
+            cmd.append("--exclude-multi-isolate")
+
+        result = run_ncbi_command(
+            cmd,
+            limiter=self.limiter,
+            log_path=self.log_dir / "ncbi_genome_summary.log",
+            allow_no_genome_data=True,
+        )
+
+        if result.returncode != 0:
+            return None
+
+        exact: list[dict[str, Any]] = []
+
+        for record in parse_json_records(result.stdout):
+
+            observed = str(
+                first_nonmissing(
+                    record.get("accession"),
+                    record.get("current_accession"),
+                    record.get("currentAccession"),
+                )
+                or ""
+            ).strip().upper()
+
+            if observed == requested:
+                exact.append(record)
+
+        if not exact:
+            return None
+
+        if len(exact) != 1:
+            raise ExternalToolError(
+                f"NCBI returned {len(exact)} exact records for assembly "
+                f"{requested}; expected exactly one."
+            )
+
+        return exact[0]
+
 
 ########################################################################################################
 # Taxonomy curation
@@ -4095,17 +4522,27 @@ def resolve_taxon_query(client: NCBIClient, name: str, taxid_text: str) -> tuple
     return chosen[0], chosen_taxid
 
 
-def parse_seed_rules(path: Path, client: NCBIClient) -> list[ResolvedTaxonRule]:
+def parse_seed_rules(
+    path: Path,
+    client: NCBIClient,
+    *,
+    allow_no_data_rows: bool = False,
+) -> list[ResolvedTaxonRule]:
     required = ["Taxon_name", "Taxid", "Include_descendants", "Tier", "Evidence_type", "Reference", "Notes"]
-    rows = read_commentable_tsv(path, required)
+    rows = read_commentable_tsv(
+        path,
+        required,
+        allow_no_data_rows=allow_no_data_rows,
+    )
     rules: list[ResolvedTaxonRule] = []
     # Total number of active seed taxa to resolve.
     # This allows progress messages to show a meaningful denominator.
     total_seeds = len(rows)
 
-    info(
-        f"Checking and validating {total_seeds} input taxa against NCBI."
-    )
+    if total_seeds:
+        info(
+            f"Checking and validating {total_seeds} input taxa against NCBI."
+        )
 
     # Enumerate seed taxa so that we know which input row is being resolved.
     for seed_index, row in enumerate(rows, start=1):
@@ -4149,10 +4586,12 @@ def parse_seed_rules(path: Path, client: NCBIClient) -> list[ResolvedTaxonRule]:
             )
     # Confirm that all input taxa have been identified and validated.
     # This message marks the end of the first curation subphase.
-    info(
-        f"Input taxon identification and validation complete: "
-        f"{total_seeds}/{total_seeds}."
-    )
+    if total_seeds:
+        info(
+            f"Input taxon identification and validation complete: "
+            f"{total_seeds}/{total_seeds}."
+        )
+
     return rules
 
 
@@ -4249,6 +4688,7 @@ def build_curated_species(
     client: NCBIClient,
     seed_rules: list[ResolvedTaxonRule],
     exclusion_rules: list[ResolvedTaxonRule],
+    explicit_include_targets: Sequence["ResolvedExplicitTarget"] = (),
 ) -> tuple[
     dict[int, SpeciesCandidate],
     list[dict[str, Any]],
@@ -4268,14 +4708,27 @@ def build_curated_species(
     seed_descendant_counts: dict[int, int] = {}
     exclusion_descendant_counts: dict[int, int] = {}
 
-    # Count the seed taxa that will be expanded.
+    # Count the seed taxa and explicit inclusion targets that can admit species.
     total_seed_rules = len(seed_rules)
+    total_explicit_targets = len(explicit_include_targets)
 
     # Clearly announce the beginning of the second curation subphase.
-    info(
-        f"Starting species-set construction from "
-        f"{total_seed_rules} validated input taxa."
-    )
+    if total_seed_rules:
+        info(
+            f"Starting species-set construction from "
+            f"{total_seed_rules} validated input taxa."
+        )
+    elif total_explicit_targets:
+        target_noun = (
+            "target"
+            if total_explicit_targets == 1
+            else "targets"
+        )
+
+        info(
+            "No seed taxa supplied; species admission is driven by "
+            f"{total_explicit_targets} explicit {target_noun}."
+        )
 
     # Number each taxon while preserving its name, TaxID and taxonomic rank.
     for seed_index, rule in enumerate(seed_rules, start=1):
@@ -4320,6 +4773,58 @@ def build_curated_species(
             conflicts,
         )
 
+    # Explicit inclusion targets may introduce species that are not present in
+    # the automatic seed-derived species set. Keep this distinct from
+    # SpeciesCandidate.explicit_include, which means an explicit species-level
+    # seed and therefore has broader taxonomic inclusion semantics.
+    explicit_targets_by_species: dict[
+        int,
+        list["ResolvedExplicitTarget"],
+    ] = defaultdict(list)
+
+    for target in explicit_include_targets:
+        explicit_targets_by_species[
+            target.species_taxid
+        ].append(target)
+
+    for taxid, targets in explicit_targets_by_species.items():
+
+        if taxid in candidates:
+            continue
+
+        species_record = targets[0].species_record
+
+        if not species_record:
+            raise DataIntegrityError(
+                f"Resolved explicit target species TaxID {taxid} has no "
+                "canonical taxonomy record."
+            )
+
+        candidate = species_record_from_taxonomy(
+            species_record
+        )
+
+        if candidate.taxid != taxid:
+            raise DataIntegrityError(
+                "Resolved explicit target taxonomy identity changed "
+                f"unexpectedly: target TaxID {taxid}, taxonomy record "
+                f"TaxID {candidate.taxid}."
+            )
+
+        # Explicit-target-only species have no seed Tier assignment. Retain the
+        # normal conservative default Tier 3 and make the provenance explicit.
+        candidate.tier = 3
+        candidate.tier_source = "EXPLICIT_TARGET"
+        candidate.explicit_include = False
+        candidate.seed_taxa = []
+        candidate.inclusion_reason = "EXPLICIT_TARGET_INCLUDE"
+
+        candidates[taxid] = candidate
+
+    explicit_target_species_taxids = set(
+        explicit_targets_by_species
+    )
+
     # Build exclusion-match map only for candidate species. We deliberately do
     # not treat "uncertain" morphology as an exclusion: only explicit taxonomy
     # rules supplied by the curator can remove a species.
@@ -4340,31 +4845,86 @@ def build_curated_species(
             continue
         candidate.matched_exclusion_taxa = sorted({r.name for r in matches})
         candidate.matched_exclusion_taxids = sorted({r.taxid for r in matches})
-        explicit_exclusions = [r for r in matches if r.explicit_species and r.taxid == taxid]
-        if candidate.explicit_include and explicit_exclusions:
+        explicit_exclusions = [
+            r
+            for r in matches
+            if r.explicit_species and r.taxid == taxid
+        ]
+
+        target_explicit_include = (
+            taxid in explicit_target_species_taxids
+        )
+
+        # An exact species-level taxonomic exclusion conflicts with either an
+        # explicit species seed or an explicit strain/assembly inclusion target.
+        # Do not silently choose one instruction over the other.
+        if (
+            candidate.explicit_include
+            or target_explicit_include
+        ) and explicit_exclusions:
+
+            include_kind = (
+                "explicit species include"
+                if candidate.explicit_include
+                else "explicit target include"
+            )
+
             explicit_conflicts.append({
                 "Type": "EXPLICIT_INCLUDE_EXCLUDE_CONFLICT",
                 "Species": candidate.species,
                 "Taxid": taxid,
-                "Seed": "explicit species include",
-                "Exclusion_rules": ";".join(f"line={r.input_line}:{r.name}" for r in explicit_exclusions),
+                "Seed": include_kind,
+                "Exclusion_rules": ";".join(
+                    f"line={r.input_line}:{r.name}"
+                    for r in explicit_exclusions
+                ),
             })
+
             continue
-        if candidate.explicit_include:
+
+        # Broader taxonomic exclusions may be overridden by an explicit include.
+        # For explicit targets this only admits the species to later inventory;
+        # 3D-C will restrict selection to the requested target rather than
+        # reactivating the entire excluded species.
+        if (
+            candidate.explicit_include
+            or target_explicit_include
+        ):
             candidate.exclusion_override = True
             candidate.final_taxonomic_status = "INCLUDED"
             status = "INCLUDED"
+
+            override_reason = (
+                "EXPLICIT_SPECIES_INCLUDE"
+                if candidate.explicit_include
+                else "EXPLICIT_TARGET_INCLUDE"
+            )
+
         else:
             candidate.final_taxonomic_status = "EXCLUDED"
             status = "EXCLUDED"
+            override_reason = "."
+
         excluded_rows.append({
             "Species": candidate.species,
             "TaxID": taxid,
-            "Matched_exclusion_taxa": ";".join(candidate.matched_exclusion_taxa),
-            "Matched_exclusion_taxids": ";".join(map(str, candidate.matched_exclusion_taxids)),
-            "Exclusion_reasons": merge_text_values(r.reason for r in matches),
-            "Exclusion_override": candidate.exclusion_override,
-            "Override_reason": "EXPLICIT_SPECIES_INCLUDE" if candidate.exclusion_override else ".",
+            "Matched_exclusion_taxa": ";".join(
+                candidate.matched_exclusion_taxa
+            ),
+            "Matched_exclusion_taxids": ";".join(
+                map(
+                    str,
+                    candidate.matched_exclusion_taxids,
+                )
+            ),
+            "Exclusion_reasons": merge_text_values(
+                r.reason
+                for r in matches
+            ),
+            "Exclusion_override": (
+                candidate.exclusion_override
+            ),
+            "Override_reason": override_reason,
             "Final_status": status,
         })
 
@@ -4400,6 +4960,350 @@ def write_resolved_taxon_rules(path: Path, rules: list[ResolvedTaxonRule], desce
             row.update({"Tier": r.tier, "Evidence_type": r.evidence_type, "Reference": r.reference, "Notes": r.notes})
         rows.append(row)
     write_tsv(path, fields, rows)
+
+
+########################################################################################################
+# Explicit strain / assembly targets
+########################################################################################################
+
+EXPLICIT_TARGET_COLUMNS = [
+    "Target_type",
+    "Species",
+    "Taxid",
+    "Strain",
+    "Assembly_accession",
+    "Evidence_type",
+    "Notes",
+]
+
+_ASSEMBLY_ACCESSION_VERSION_RE = re.compile(
+    r"^(GCF|GCA)_[0-9]+\.[0-9]+$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class ExplicitTargetRule:
+    action: str
+    input_path: str
+    input_line: int
+    target_type: str
+
+    species: str | None
+    input_taxid: str | None
+    taxid: int | None
+
+    strain: str | None
+    strain_key: str | None
+
+    input_assembly_accession: str | None
+    assembly_accession: str | None
+
+    evidence_type: str
+    notes: str
+
+
+def normalize_explicit_species_identity(
+    value: str | None,
+) -> str | None:
+    """Normalize a species label only for local target identity comparisons."""
+
+    value = normalize_missing(value)
+
+    if value is None:
+        return None
+
+    return re.sub(
+        r"\s+",
+        " ",
+        value.strip(),
+    ).casefold()
+
+
+def explicit_target_identity_key(
+    target: ExplicitTargetRule,
+) -> tuple[str, ...]:
+    """Return the strongest syntactic identity available before NCBI resolution."""
+
+    if target.target_type == "assembly":
+
+        assert target.assembly_accession is not None
+
+        return (
+            "assembly",
+            target.assembly_accession,
+        )
+
+    assert target.target_type == "strain"
+    assert target.strain_key is not None
+
+    if target.taxid is not None:
+
+        species_identity = (
+            "taxid",
+            str(target.taxid),
+        )
+
+    else:
+
+        species_key = normalize_explicit_species_identity(
+            target.species,
+        )
+
+        assert species_key is not None
+
+        species_identity = (
+            "name",
+            species_key,
+        )
+
+    return (
+        "strain",
+        *species_identity,
+        target.strain_key,
+    )
+
+
+def explicit_target_display(
+    target: ExplicitTargetRule,
+) -> str:
+    """Render one explicit target for concise validation errors."""
+
+    if target.target_type == "assembly":
+
+        return (
+            target.assembly_accession
+            or target.input_assembly_accession
+            or "<missing assembly>"
+        )
+
+    species = (
+        f"TaxID {target.taxid}"
+        if target.taxid is not None
+        else target.species or "<missing species>"
+    )
+
+    return (
+        f"{species}; strain={target.strain or '<missing strain>'}"
+    )
+
+
+def parse_explicit_targets(
+    path: Path | None,
+    *,
+    action: str,
+    warn_if_empty: bool = False,
+) -> list[ExplicitTargetRule]:
+    """Parse and syntactically validate explicit strain/assembly target rules.
+
+    This stage performs no NCBI lookups. Species identity, strain membership and
+    assembly metadata are resolved/validated against NCBI in the later target
+    resolution stage.
+    """
+
+    if action not in {"include", "exclude"}:
+        raise ValueError(
+            f"Unsupported explicit-target action: {action!r}"
+        )
+
+    if path is None:
+        return []
+
+    rows = read_commentable_tsv(
+        path,
+        EXPLICIT_TARGET_COLUMNS,
+        allow_no_data_rows=True,
+    )
+
+    if not rows:
+
+        if warn_if_empty:
+            warn(
+                f"The supplied explicit-{action} target file contains no active "
+                f"target rows: {path}."
+            )
+
+        return []
+
+    rules: list[ExplicitTargetRule] = []
+    seen: dict[tuple[str, ...], ExplicitTargetRule] = {}
+
+    for row in rows:
+
+        line = int(row["__line__"])
+
+        target_type = (
+            normalize_missing(row["Target_type"])
+            or ""
+        ).casefold()
+
+        if target_type not in {"assembly", "strain"}:
+            raise ConfigError(
+                f"{path}:{line}: Target_type must be 'assembly' or 'strain'; "
+                f"received {row['Target_type']!r}."
+            )
+
+        species = normalize_missing(
+            row["Species"]
+        )
+
+        input_taxid = normalize_missing(
+            row["Taxid"]
+        )
+
+        taxid: int | None = None
+
+        if input_taxid is not None:
+
+            try:
+                taxid = int(input_taxid)
+
+            except ValueError as exc:
+                raise ConfigError(
+                    f"{path}:{line}: Taxid must be a positive integer when "
+                    f"provided; received {input_taxid!r}."
+                ) from exc
+
+            if taxid <= 0:
+                raise ConfigError(
+                    f"{path}:{line}: Taxid must be a positive integer when "
+                    f"provided; received {input_taxid!r}."
+                )
+
+        strain = normalize_missing(
+            row["Strain"]
+        )
+
+        strain_key = (
+            normalize_selection_label(strain)
+            if strain is not None
+            else None
+        )
+
+        input_assembly_accession = normalize_missing(
+            row["Assembly_accession"]
+        )
+
+        assembly_accession: str | None = None
+
+        if input_assembly_accession is not None:
+
+            if not _ASSEMBLY_ACCESSION_VERSION_RE.fullmatch(
+                input_assembly_accession
+            ):
+                raise ConfigError(
+                    f"{path}:{line}: Assembly_accession must be an exact "
+                    "versioned NCBI assembly accession such as "
+                    f"GCF_000001405.40 or GCA_000001405.29; received "
+                    f"{input_assembly_accession!r}."
+                )
+
+            assembly_accession = (
+                input_assembly_accession.upper()
+            )
+
+        if target_type == "assembly":
+
+            if assembly_accession is None:
+                raise ConfigError(
+                    f"{path}:{line}: Target_type='assembly' requires "
+                    "Assembly_accession."
+                )
+
+        else:
+
+            if strain is None or strain_key is None:
+                raise ConfigError(
+                    f"{path}:{line}: Target_type='strain' requires Strain."
+                )
+
+            if species is None and taxid is None:
+                raise ConfigError(
+                    f"{path}:{line}: Target_type='strain' requires at least "
+                    "one species identifier: Species or Taxid."
+                )
+
+            if assembly_accession is not None:
+                raise ConfigError(
+                    f"{path}:{line}: Assembly_accession must be empty for "
+                    "Target_type='strain'. Use Target_type='assembly' to target "
+                    "an exact assembly accession."
+                )
+
+        rule = ExplicitTargetRule(
+            action=action,
+            input_path=str(path),
+            input_line=line,
+            target_type=target_type,
+            species=species,
+            input_taxid=input_taxid,
+            taxid=taxid,
+            strain=strain,
+            strain_key=strain_key,
+            input_assembly_accession=input_assembly_accession,
+            assembly_accession=assembly_accession,
+            evidence_type=(
+                normalize_missing(
+                    row["Evidence_type"]
+                )
+                or "."
+            ),
+            notes=(
+                normalize_missing(
+                    row["Notes"]
+                )
+                or "."
+            ),
+        )
+
+        identity = explicit_target_identity_key(
+            rule
+        )
+
+        previous = seen.get(identity)
+
+        if previous is not None:
+            raise ConfigError(
+                f"{path}:{line}: duplicate explicit {action} target "
+                f"{explicit_target_display(rule)!r}; the same target was "
+                f"already defined at line {previous.input_line}."
+            )
+
+        seen[identity] = rule
+        rules.append(rule)
+
+    return rules
+
+
+def detect_explicit_target_conflicts(
+    include_targets: Sequence[ExplicitTargetRule],
+    exclude_targets: Sequence[ExplicitTargetRule],
+) -> None:
+    """Reject targets that are syntactically both included and excluded."""
+
+    includes = {
+        explicit_target_identity_key(target): target
+        for target in include_targets
+    }
+
+    for excluded in exclude_targets:
+
+        identity = explicit_target_identity_key(
+            excluded
+        )
+
+        included = includes.get(identity)
+
+        if included is None:
+            continue
+
+        raise ConfigError(
+            "Explicit target conflict: the same target is both included and "
+            "excluded.\n\n"
+            f"Target: {explicit_target_display(excluded)}\n"
+            f"Include: {included.input_path}:{included.input_line}\n"
+            f"Exclude: {excluded.input_path}:{excluded.input_line}"
+        )
 
 
 ########################################################################################################
@@ -5317,10 +6221,942 @@ def inventory_species_assemblies(
     return result
 
 
+########################################################################################################
+# Explicit target NCBI resolution
+########################################################################################################
+
+@dataclass(frozen=True)
+class ResolvedExplicitTarget:
+    rule: ExplicitTargetRule
+    species_taxid: int
+    species: str
+    strain: str | None
+    strain_key: str | None
+    assembly_accession: str | None
+
+    assembly: AssemblyRecord | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+
+    species_record: dict[str, Any] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+
+
+def resolved_explicit_target_identity_key(
+    target: ResolvedExplicitTarget,
+) -> tuple[str, ...]:
+    """Return the canonical biological identity of a resolved explicit target."""
+
+    if target.rule.target_type == "assembly":
+
+        assert target.assembly_accession is not None
+
+        return (
+            "assembly",
+            target.assembly_accession.upper(),
+        )
+
+    assert target.strain_key is not None
+
+    return (
+        "strain",
+        str(target.species_taxid),
+        target.strain_key,
+    )
+
+
+def resolve_explicit_species_reference(
+    client: NCBIClient,
+    target: ExplicitTargetRule,
+) -> tuple[dict[str, Any], int, str]:
+    """Resolve a Species/Taxid target reference and require species rank."""
+
+    record, taxid = resolve_taxon_query(
+        client,
+        target.species or ".",
+        target.input_taxid or ".",
+    )
+
+    rank = taxonomy_rank(record)
+    name = taxonomy_name(record)
+
+    if rank != "species":
+        raise ConfigError(
+            f"{target.input_path}:{target.input_line}: explicit "
+            f"{target.target_type} target species identity must resolve to "
+            f"NCBI rank 'species'; resolved to {name!r} ({rank or 'unknown rank'}, "
+            f"TaxID {taxid})."
+        )
+
+    if not name:
+        raise ExternalToolError(
+            f"NCBI species record for TaxID {taxid} has no scientific name."
+        )
+
+    return record, taxid, name
+
+
+def resolve_canonical_species_for_taxid(
+    client: NCBIClient,
+    taxid: int,
+    *,
+    context: str,
+) -> tuple[dict[str, Any], int, str]:
+    """Resolve any organism TaxID to exactly one canonical species ancestor.
+
+    Assembly reports may occasionally reference below-species or historical
+    TaxIDs. Use NCBI taxonomy lineage/classification rather than assuming that
+    the assembly organism TaxID itself is the species TaxID.
+    """
+
+    records = client.taxonomy(
+        taxid,
+        parents=True,
+    )
+
+    if not records:
+        raise ExternalToolError(
+            f"NCBI taxonomy returned no records while resolving species for "
+            f"{context} from organism TaxID {taxid}."
+        )
+
+    candidate_taxids: set[int] = set()
+    species_records: dict[int, dict[str, Any]] = {}
+
+    for record in records:
+
+        record_taxid = taxonomy_taxid(record)
+
+        if (
+            record_taxid is not None
+            and taxonomy_rank(record) == "species"
+        ):
+            candidate_taxids.add(record_taxid)
+            species_records[record_taxid] = record
+
+        _, classified_species_taxid = classification_value(
+            record,
+            "species",
+        )
+
+        if classified_species_taxid is not None:
+            candidate_taxids.add(
+                classified_species_taxid
+            )
+
+    if len(candidate_taxids) != 1:
+        rendered = (
+            ", ".join(
+                str(value)
+                for value in sorted(candidate_taxids)
+            )
+            or "none"
+        )
+
+        raise ExternalToolError(
+            f"Could not resolve exactly one canonical species for {context} "
+            f"from organism TaxID {taxid}; species candidates: {rendered}."
+        )
+
+    species_taxid = next(iter(candidate_taxids))
+
+    species_record = species_records.get(
+        species_taxid
+    )
+
+    if species_record is None:
+
+        exact_records = client.taxonomy(
+            species_taxid,
+            parents=True,
+        )
+
+        exact_species = [
+            record
+            for record in exact_records
+            if (
+                taxonomy_taxid(record) == species_taxid
+                and taxonomy_rank(record) == "species"
+            )
+        ]
+
+        if len(exact_species) != 1:
+            raise ExternalToolError(
+                f"NCBI taxonomy did not return exactly one species record for "
+                f"canonical TaxID {species_taxid} while resolving {context}."
+            )
+
+        species_record = exact_species[0]
+
+    species_name = taxonomy_name(
+        species_record
+    )
+
+    if not species_name:
+        raise ExternalToolError(
+            f"NCBI canonical species TaxID {species_taxid} has no scientific "
+            f"name while resolving {context}."
+        )
+
+    return (
+        species_record,
+        species_taxid,
+        species_name,
+    )
+
+
+def explicit_assembly_organism_taxid(
+    record: Mapping[str, Any],
+    *,
+    accession: str,
+) -> int:
+    """Return the organism TaxID carried by one NCBI genome report."""
+
+    organism = (
+        record.get("organism")
+        if isinstance(record.get("organism"), Mapping)
+        else {}
+    )
+
+    raw = first_nonmissing(
+        organism.get("tax_id"),
+        organism.get("taxId"),
+        organism.get("taxid"),
+        record.get("tax_id"),
+        record.get("taxId"),
+        record.get("taxid"),
+    )
+
+    try:
+        taxid = int(raw)
+
+    except (TypeError, ValueError) as exc:
+        raise ExternalToolError(
+            f"NCBI genome record for explicit assembly {accession} does not "
+            "contain a valid organism TaxID."
+        ) from exc
+
+    if taxid <= 0:
+        raise ExternalToolError(
+            f"NCBI genome record for explicit assembly {accession} contains "
+            f"invalid organism TaxID {taxid}."
+        )
+
+    return taxid
+
+
+def resolve_explicit_targets(
+    client: NCBIClient,
+    targets: Sequence[ExplicitTargetRule],
+) -> list[ResolvedExplicitTarget]:
+    """Resolve explicit strain/assembly targets against current NCBI metadata."""
+
+    resolved: list[ResolvedExplicitTarget] = []
+
+    species_reference_cache: dict[
+        tuple[str | None, int | None],
+        tuple[dict[str, Any], int, str],
+    ] = {}
+
+    canonical_species_cache: dict[
+        int,
+        tuple[dict[str, Any], int, str],
+    ] = {}
+
+    assembly_cache: dict[
+        str,
+        tuple[dict[str, Any], bool],
+    ] = {}
+
+    def target_species_reference(
+        target: ExplicitTargetRule,
+    ) -> tuple[dict[str, Any], int, str]:
+
+        key = (
+            normalize_explicit_species_identity(
+                target.species
+            ),
+            target.taxid,
+        )
+
+        cached = species_reference_cache.get(
+            key
+        )
+
+        if cached is not None:
+            return cached
+
+        value = resolve_explicit_species_reference(
+            client,
+            target,
+        )
+
+        species_reference_cache[key] = value
+        return value
+
+    for target in targets:
+
+        if target.target_type == "strain":
+
+            species_record, species_taxid, species_name = (
+                target_species_reference(
+                    target
+                )
+            )
+
+            assert target.strain is not None
+            assert target.strain_key is not None
+
+            resolved.append(
+                ResolvedExplicitTarget(
+                    rule=target,
+                    species_taxid=species_taxid,
+                    species=species_name,
+                    strain=target.strain,
+                    strain_key=target.strain_key,
+                    assembly_accession=None,
+                    assembly=None,
+                    species_record=dict(species_record),
+                )
+            )
+
+            continue
+
+        assert target.target_type == "assembly"
+        assert target.assembly_accession is not None
+
+        accession = (
+            target.assembly_accession.upper()
+        )
+
+        cached_assembly = assembly_cache.get(
+            accession
+        )
+
+        if cached_assembly is None:
+
+            raw_record = client.genome_by_accession(
+                accession,
+                exclude_multi_isolate=False,
+            )
+
+            if raw_record is None:
+                raise ConfigError(
+                    f"{target.input_path}:{target.input_line}: explicit assembly "
+                    f"target {accession!r} was not returned by NCBI as that exact "
+                    "accession.version."
+                )
+
+            non_multi_record = client.genome_by_accession(
+                accession,
+                exclude_multi_isolate=True,
+            )
+
+            multi_isolate = (
+                non_multi_record is None
+            )
+
+            cached_assembly = (
+                raw_record,
+                multi_isolate,
+            )
+
+            assembly_cache[
+                accession
+            ] = cached_assembly
+
+        raw_record, multi_isolate = (
+            cached_assembly
+        )
+
+        organism_taxid = (
+            explicit_assembly_organism_taxid(
+                raw_record,
+                accession=accession,
+            )
+        )
+
+        canonical_species = (
+            canonical_species_cache.get(
+                organism_taxid
+            )
+        )
+
+        if canonical_species is None:
+
+            canonical_species = (
+                resolve_canonical_species_for_taxid(
+                    client,
+                    organism_taxid,
+                    context=(
+                        f"explicit assembly {accession}"
+                    ),
+                )
+            )
+
+            canonical_species_cache[
+                organism_taxid
+            ] = canonical_species
+
+        (
+            species_record,
+            species_taxid,
+            species_name,
+        ) = canonical_species
+
+        species_candidate = SpeciesCandidate(
+            taxid=species_taxid,
+            species=species_name,
+        )
+
+        assembly = normalize_assembly_record(
+            raw_record,
+            species_candidate,
+            multi_isolate,
+        )
+
+        if assembly.accession.upper() != accession:
+            raise ExternalToolError(
+                f"NCBI exact assembly lookup requested {accession}, but "
+                f"normalization produced {assembly.accession!r}."
+            )
+
+        if (
+            target.species is not None
+            or target.taxid is not None
+        ):
+
+            (
+                _,
+                hinted_species_taxid,
+                hinted_species_name,
+            ) = target_species_reference(
+                target
+            )
+
+            if hinted_species_taxid != species_taxid:
+                raise ConfigError(
+                    f"{target.input_path}:{target.input_line}: explicit assembly "
+                    f"target {accession} belongs to NCBI species "
+                    f"{species_name!r} (TaxID {species_taxid}), but the supplied "
+                    f"Species/Taxid resolves to {hinted_species_name!r} "
+                    f"(TaxID {hinted_species_taxid})."
+                )
+
+        observed_strain_key = (
+            normalize_selection_label(
+                assembly.strain
+            )
+            if assembly.strain is not None
+            else None
+        )
+
+        if target.strain_key is not None:
+
+            if observed_strain_key is None:
+                raise ConfigError(
+                    f"{target.input_path}:{target.input_line}: explicit assembly "
+                    f"target {accession} specifies strain {target.strain!r}, but "
+                    "the NCBI assembly record has no strain metadata."
+                )
+
+            if (
+                observed_strain_key
+                != target.strain_key
+            ):
+                raise ConfigError(
+                    f"{target.input_path}:{target.input_line}: explicit assembly "
+                    f"target {accession} specifies strain {target.strain!r}, but "
+                    f"NCBI reports strain {assembly.strain!r}."
+                )
+
+        resolved.append(
+            ResolvedExplicitTarget(
+                rule=target,
+                species_taxid=species_taxid,
+                species=species_name,
+                strain=assembly.strain,
+                strain_key=observed_strain_key,
+                assembly_accession=accession,
+                assembly=assembly,
+                species_record=dict(species_record),
+            )
+        )
+
+    return resolved
+
+
+def detect_resolved_explicit_target_conflicts(
+    include_targets: Sequence[ResolvedExplicitTarget],
+    exclude_targets: Sequence[ResolvedExplicitTarget],
+) -> None:
+    """Reject duplicates/conflicts using canonical NCBI-resolved identities."""
+
+    def reject_resolved_duplicates(
+        targets: Sequence[ResolvedExplicitTarget],
+        *,
+        action: str,
+    ) -> None:
+
+        seen: dict[
+            tuple[str, ...],
+            ResolvedExplicitTarget,
+        ] = {}
+
+        for target in targets:
+
+            identity = (
+                resolved_explicit_target_identity_key(
+                    target
+                )
+            )
+
+            previous = seen.get(
+                identity
+            )
+
+            if previous is not None:
+                raise ConfigError(
+                    "Duplicate explicit target after NCBI resolution: "
+                    f"{explicit_target_display(target.rule)!r} resolves to the "
+                    f"same biological target as "
+                    f"{previous.rule.input_path}:{previous.rule.input_line}.\n"
+                    f"Current: {target.rule.input_path}:{target.rule.input_line}\n"
+                    f"Action: {action}"
+                )
+
+            seen[identity] = target
+
+    reject_resolved_duplicates(
+        include_targets,
+        action="include",
+    )
+
+    reject_resolved_duplicates(
+        exclude_targets,
+        action="exclude",
+    )
+
+    included_by_identity = {
+        resolved_explicit_target_identity_key(
+            target
+        ): target
+        for target in include_targets
+    }
+
+    for excluded in exclude_targets:
+
+        identity = (
+            resolved_explicit_target_identity_key(
+                excluded
+            )
+        )
+
+        included = included_by_identity.get(
+            identity
+        )
+
+        if included is None:
+            continue
+
+        raise ConfigError(
+            "Explicit target conflict after NCBI resolution: the same "
+            "biological target is both included and excluded.\n"
+            f"Target: {explicit_target_display(excluded.rule)}\n"
+            f"Include: {included.rule.input_path}:{included.rule.input_line}\n"
+            f"Exclude: {excluded.rule.input_path}:{excluded.rule.input_line}"
+        )
+
+    # A specific assembly cannot be explicitly included while its actual NCBI
+    # strain is explicitly excluded. The reverse is not inherently a conflict:
+    # an included strain may still be represented by another non-excluded
+    # assembly.
+    excluded_strains = {
+        (
+            target.species_taxid,
+            target.strain_key,
+        ): target
+        for target in exclude_targets
+        if (
+            target.rule.target_type == "strain"
+            and target.strain_key is not None
+        )
+    }
+
+    for included in include_targets:
+
+        if (
+            included.rule.target_type
+            != "assembly"
+            or included.strain_key is None
+        ):
+            continue
+
+        excluded_strain = (
+            excluded_strains.get(
+                (
+                    included.species_taxid,
+                    included.strain_key,
+                )
+            )
+        )
+
+        if excluded_strain is None:
+            continue
+
+        raise ConfigError(
+            "Explicit target conflict after NCBI resolution: assembly "
+            f"{included.assembly_accession} is explicitly included, but NCBI "
+            f"assigns it to strain {included.strain!r} of "
+            f"{included.species!r} (TaxID {included.species_taxid}), and that "
+            "strain is explicitly excluded.\n"
+            f"Include: {included.rule.input_path}:{included.rule.input_line}\n"
+            f"Exclude: "
+            f"{excluded_strain.rule.input_path}:{excluded_strain.rule.input_line}"
+        )
+
+
+def report_resolved_explicit_targets(
+    include_targets: Sequence[ResolvedExplicitTarget],
+    exclude_targets: Sequence[ResolvedExplicitTarget],
+) -> None:
+    """Report resolved explicit-target counts without changing selection state."""
+
+    include_count = len(include_targets)
+    exclude_count = len(exclude_targets)
+
+    if not include_count and not exclude_count:
+        return
+
+    include_noun = (
+        "target"
+        if include_count == 1
+        else "targets"
+    )
+
+    exclude_noun = (
+        "target"
+        if exclude_count == 1
+        else "targets"
+    )
+
+    info(
+        "Explicit targets resolved: "
+        f"{include_count} inclusion {include_noun}, "
+        f"{exclude_count} exclusion {exclude_noun}. "
+        "Target species are incorporated into taxonomy curation."
+    )
+
+
+def resolved_explicit_target_to_jsonable(
+    target: ResolvedExplicitTarget,
+) -> dict[str, Any]:
+    """Return one resolved explicit target as deterministic JSON data."""
+
+    return {
+        "rule": dict(vars(target.rule)),
+        "species_taxid": target.species_taxid,
+        "species": target.species,
+        "strain": target.strain,
+        "strain_key": target.strain_key,
+        "assembly_accession": target.assembly_accession,
+        "assembly": (
+            dict(vars(target.assembly))
+            if target.assembly is not None
+            else None
+        ),
+        "species_record": dict(target.species_record),
+    }
+
+
+def save_resolved_explicit_targets(
+    path: Path,
+    targets: Sequence[ResolvedExplicitTarget],
+) -> None:
+    """Persist canonical target resolution for deterministic resume."""
+
+    save_json_atomic(
+        path,
+        {
+            "schema_version": (
+                RESOLVED_EXPLICIT_TARGETS_SCHEMA_VERSION
+            ),
+            "targets": [
+                resolved_explicit_target_to_jsonable(
+                    target
+                )
+                for target in targets
+            ],
+        },
+    )
+
+
+def load_resolved_explicit_targets(
+    path: Path,
+    expected_rules: Sequence[ExplicitTargetRule],
+) -> list[ResolvedExplicitTarget]:
+    """Reload previously committed canonical explicit-target resolution."""
+
+    expected = list(
+        expected_rules
+    )
+
+    if not path.is_file():
+
+        # Older/no-target builds do not need an empty derived file merely to
+        # resume. Active explicit targets, however, must never be silently
+        # re-resolved against a later NCBI state.
+        if not expected:
+            return []
+
+        raise DataIntegrityError(
+            "Committed taxonomy state uses explicit targets, but the "
+            "persisted canonical target-resolution file is missing: "
+            f"{path}"
+        )
+
+    try:
+        payload = json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+
+    except (
+        OSError,
+        json.JSONDecodeError,
+    ) as exc:
+
+        raise DataIntegrityError(
+            "Could not read persisted canonical explicit-target resolution: "
+            f"{path}: {exc}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise DataIntegrityError(
+            "Persisted explicit-target resolution is not a JSON object: "
+            f"{path}"
+        )
+
+    schema_version = payload.get(
+        "schema_version"
+    )
+
+    if (
+        schema_version
+        != RESOLVED_EXPLICIT_TARGETS_SCHEMA_VERSION
+    ):
+        raise DataIntegrityError(
+            "Unsupported persisted explicit-target resolution schema: "
+            f"{schema_version!r}"
+        )
+
+    raw_targets = payload.get(
+        "targets"
+    )
+
+    if not isinstance(raw_targets, list):
+        raise DataIntegrityError(
+            "Persisted explicit-target resolution has no valid targets list."
+        )
+
+    resolved: list[
+        ResolvedExplicitTarget
+    ] = []
+
+    for index, raw in enumerate(
+        raw_targets,
+        start=1,
+    ):
+
+        if not isinstance(raw, dict):
+            raise DataIntegrityError(
+                "Persisted explicit-target resolution contains a malformed "
+                f"target at position {index}."
+            )
+
+        raw_rule = raw.get(
+            "rule"
+        )
+
+        if not isinstance(raw_rule, dict):
+            raise DataIntegrityError(
+                "Persisted explicit-target resolution contains a malformed "
+                f"rule at position {index}."
+            )
+
+        try:
+            rule = ExplicitTargetRule(
+                **raw_rule
+            )
+
+            raw_assembly = raw.get(
+                "assembly"
+            )
+
+            assembly = (
+                AssemblyRecord(
+                    **raw_assembly
+                )
+                if isinstance(
+                    raw_assembly,
+                    dict,
+                )
+                else None
+            )
+
+            raw_species_record = raw.get(
+                "species_record",
+                {},
+            )
+
+            if not isinstance(
+                raw_species_record,
+                dict,
+            ):
+                raise TypeError(
+                    "species_record is not an object"
+                )
+
+            target = ResolvedExplicitTarget(
+                rule=rule,
+                species_taxid=int(
+                    raw["species_taxid"]
+                ),
+                species=str(
+                    raw["species"]
+                ),
+                strain=raw.get(
+                    "strain"
+                ),
+                strain_key=raw.get(
+                    "strain_key"
+                ),
+                assembly_accession=raw.get(
+                    "assembly_accession"
+                ),
+                assembly=assembly,
+                species_record=dict(
+                    raw_species_record
+                ),
+            )
+
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+
+            raise DataIntegrityError(
+                "Persisted explicit-target resolution contains invalid "
+                f"target data at position {index}: {exc}"
+            ) from exc
+
+        if (
+            target.rule.target_type
+            == "assembly"
+            and target.assembly is None
+        ):
+            raise DataIntegrityError(
+                "Persisted resolved assembly target is missing its "
+                f"AssemblyRecord: {target.assembly_accession}"
+            )
+
+        resolved.append(
+            target
+        )
+
+    persisted_rules = [
+        target.rule
+        for target in resolved
+    ]
+
+    if persisted_rules != expected:
+        raise DataIntegrityError(
+            "Persisted canonical explicit-target resolution does not match "
+            "the current immutable explicit-target snapshots."
+        )
+
+    return resolved
+
+
+def merge_explicit_assembly_targets_into_inventory(
+    records: Sequence[AssemblyRecord],
+    species_taxid: int,
+    explicit_include_targets: Sequence[ResolvedExplicitTarget],
+) -> tuple[list[AssemblyRecord], set[str]]:
+    """Inject exact explicit assembly targets missing from normal discovery.
+
+    Returns the merged inventory and the exact accessions that are mandatory
+    explicit assembly targets for this species.
+
+    Existing normally discovered records are retained rather than duplicated.
+    """
+
+    merged = list(records)
+
+    by_accession = {
+        assembly.accession: assembly
+        for assembly in merged
+    }
+
+    required_accessions: set[str] = set()
+
+    for target in explicit_include_targets:
+
+        if target.rule.target_type != "assembly":
+            continue
+
+        if target.species_taxid != species_taxid:
+            continue
+
+        accession = target.assembly_accession
+
+        if accession is None or target.assembly is None:
+            raise DataIntegrityError(
+                "Resolved explicit assembly target is missing its normalized "
+                f"assembly record for species TaxID {species_taxid}."
+            )
+
+        if target.assembly.species_taxid != species_taxid:
+            raise DataIntegrityError(
+                f"Explicit assembly {accession} resolved to species TaxID "
+                f"{target.assembly.species_taxid}, but is being injected into "
+                f"species TaxID {species_taxid}."
+            )
+
+        required_accessions.add(
+            accession
+        )
+
+        if accession in by_accession:
+            continue
+
+        merged.append(
+            target.assembly
+        )
+
+        by_accession[
+            accession
+        ] = target.assembly
+
+    return (
+        merged,
+        required_accessions,
+    )
+
+
 def assembly_source_scope(
     assembly: AssemblyRecord,
     inventory_by_accession: Mapping[str, AssemblyRecord],
     config: BuildConfig,
+    *,
+    explicit_include_accessions: set[str] | None = None,
 ) -> tuple[bool, str]:
     """Determine whether an assembly belongs to the requested source scope.
 
@@ -5331,10 +7167,25 @@ def assembly_source_scope(
     enabled, eligible unpaired GCA/GenBank assemblies are also admitted.
     """
 
+    explicit_accessions = (
+        explicit_include_accessions
+        if explicit_include_accessions is not None
+        else set()
+    )
+
     if assembly.source == "GCF":
         return True, "IN_SCOPE"
 
     if assembly.source == "GCA":
+
+        # An exact explicit GCA target is a narrow exception to the automatic
+        # source-scope policy. This does not enable any other GCA assembly for
+        # the species and does not alter the global --include-gca setting.
+        #
+        # Likewise, an explicitly requested exact GCA is not substituted by its
+        # paired GCF.
+        if assembly.accession in explicit_accessions:
+            return True, "EXPLICIT_TARGET_IN_SCOPE"
 
         if not config.include_gca:
             return False, "GCA_NOT_ENABLED"
@@ -5559,6 +7410,325 @@ def assembly_selection_policy(
     )
 
 
+EXPLICIT_SELECTION_SCOPE_EXCLUSION_REASONS = frozenset({
+    "EXPLICIT_ASSEMBLY_EXCLUDED",
+    "EXPLICIT_STRAIN_EXCLUDED",
+    "OUTSIDE_EXPLICIT_TARGET_SCOPE",
+})
+
+
+@dataclass(frozen=True)
+class AssemblySelectionConstraints:
+    """Explicit biological constraints for one species selection."""
+
+    include_accessions: frozenset[str] = field(
+        default_factory=frozenset
+    )
+
+    include_strains: frozenset[str] = field(
+        default_factory=frozenset
+    )
+
+    exclude_accessions: frozenset[str] = field(
+        default_factory=frozenset
+    )
+
+    exclude_strains: frozenset[str] = field(
+        default_factory=frozenset
+    )
+
+    # False is used when a species exists in the build only because an
+    # explicit target admitted it. In that case, non-target assemblies must
+    # not become an automatic back door around the narrow explicit request.
+    automatic_selection_enabled: bool = True
+
+
+def validate_assembly_selection_constraints(
+    assemblies: Sequence[AssemblyRecord],
+    constraints: AssemblySelectionConstraints,
+) -> None:
+    """Validate explicit selection requirements against the eligible pool."""
+
+    accession_overlap = (
+        constraints.include_accessions
+        & constraints.exclude_accessions
+    )
+
+    if accession_overlap:
+        raise DataIntegrityError(
+            "Assembly selection constraints both include and exclude "
+            "the same accession(s): "
+            + ", ".join(sorted(accession_overlap))
+        )
+
+    strain_overlap = (
+        constraints.include_strains
+        & constraints.exclude_strains
+    )
+
+    if strain_overlap:
+        raise DataIntegrityError(
+            "Assembly selection constraints both include and exclude "
+            "the same strain key(s): "
+            + ", ".join(sorted(strain_overlap))
+        )
+
+    by_accession = {
+        assembly.accession: assembly
+        for assembly in assemblies
+    }
+
+    missing_accessions = (
+        constraints.include_accessions
+        - set(by_accession)
+    )
+
+    if missing_accessions:
+        raise ConfigError(
+            "One or more explicitly included assembly targets are not "
+            "present among the eligible assembly candidates: "
+            + ", ".join(sorted(missing_accessions))
+        )
+
+    available_strains: set[str] = set()
+
+    for assembly in assemblies:
+
+        accession = assembly.accession
+        strain_key = strain_selection_key(
+            assembly
+        )
+
+        if accession in constraints.exclude_accessions:
+            continue
+
+        if (
+            strain_key is not None
+            and strain_key in constraints.exclude_strains
+        ):
+            continue
+
+        if strain_key is not None:
+            available_strains.add(
+                strain_key
+            )
+
+    missing_strains = (
+        constraints.include_strains
+        - available_strains
+    )
+
+    if missing_strains:
+        raise ConfigError(
+            "One or more explicitly included strain targets have no "
+            "eligible non-excluded assembly candidates: "
+            + ", ".join(sorted(missing_strains))
+        )
+
+    for accession in constraints.include_accessions:
+
+        assembly = by_accession[
+            accession
+        ]
+
+        strain_key = strain_selection_key(
+            assembly
+        )
+
+        if (
+            strain_key is not None
+            and strain_key in constraints.exclude_strains
+        ):
+            raise DataIntegrityError(
+                f"Explicitly included assembly {accession} belongs to "
+                f"explicitly excluded strain key {strain_key!r}."
+            )
+
+
+def build_assembly_selection_constraints_by_species(
+    species_map: Mapping[int, SpeciesCandidate],
+    include_targets: Sequence[ResolvedExplicitTarget],
+    exclude_targets: Sequence[ResolvedExplicitTarget],
+) -> dict[int, AssemblySelectionConstraints]:
+    """Build per-species explicit selection constraints.
+
+    Explicit targets are additive for ordinary seed-derived species.
+
+    A species admitted only because of an explicit target, or restored through
+    a target-specific override of a broader taxonomic exclusion, is target-only:
+    automatic selection must not activate unrelated assemblies or strains.
+    """
+
+    include_accessions: dict[
+        int,
+        set[str],
+    ] = defaultdict(set)
+
+    include_strains: dict[
+        int,
+        set[str],
+    ] = defaultdict(set)
+
+    exclude_accessions: dict[
+        int,
+        set[str],
+    ] = defaultdict(set)
+
+    exclude_strains: dict[
+        int,
+        set[str],
+    ] = defaultdict(set)
+
+    species_with_explicit_include: set[int] = set()
+
+    for target in include_targets:
+
+        if target.rule.action != "include":
+            raise DataIntegrityError(
+                "Include-target collection contains a non-include rule: "
+                f"{target.rule.action!r}."
+            )
+
+        taxid = target.species_taxid
+
+        if taxid not in species_map:
+            raise DataIntegrityError(
+                "Resolved explicit include target species is absent from the "
+                f"curated species map: TaxID {taxid}."
+            )
+
+        species_with_explicit_include.add(
+            taxid
+        )
+
+        if target.rule.target_type == "assembly":
+
+            if target.assembly_accession is None:
+                raise DataIntegrityError(
+                    "Resolved explicit assembly include is missing its "
+                    "assembly accession."
+                )
+
+            include_accessions[taxid].add(
+                target.assembly_accession
+            )
+
+        elif target.rule.target_type == "strain":
+
+            if target.strain_key is None:
+                raise DataIntegrityError(
+                    "Resolved explicit strain include is missing its "
+                    "normalized strain key."
+                )
+
+            include_strains[taxid].add(
+                target.strain_key
+            )
+
+        else:
+            raise DataIntegrityError(
+                "Unsupported resolved explicit include target type: "
+                f"{target.rule.target_type!r}."
+            )
+
+    for target in exclude_targets:
+
+        if target.rule.action != "exclude":
+            raise DataIntegrityError(
+                "Exclude-target collection contains a non-exclude rule: "
+                f"{target.rule.action!r}."
+            )
+
+        taxid = target.species_taxid
+
+        # An exclusion does not itself admit a species to the build. If the
+        # species is outside the active curated species set, the exclusion is
+        # simply irrelevant to this selection run.
+        if taxid not in species_map:
+            continue
+
+        if target.rule.target_type == "assembly":
+
+            if target.assembly_accession is None:
+                raise DataIntegrityError(
+                    "Resolved explicit assembly exclusion is missing its "
+                    "assembly accession."
+                )
+
+            exclude_accessions[taxid].add(
+                target.assembly_accession
+            )
+
+        elif target.rule.target_type == "strain":
+
+            if target.strain_key is None:
+                raise DataIntegrityError(
+                    "Resolved explicit strain exclusion is missing its "
+                    "normalized strain key."
+                )
+
+            exclude_strains[taxid].add(
+                target.strain_key
+            )
+
+        else:
+            raise DataIntegrityError(
+                "Unsupported resolved explicit exclude target type: "
+                f"{target.rule.target_type!r}."
+            )
+
+    result: dict[
+        int,
+        AssemblySelectionConstraints,
+    ] = {}
+
+    for taxid, species in species_map.items():
+
+        target_only_species = (
+            taxid in species_with_explicit_include
+            and (
+                species.inclusion_reason
+                == "EXPLICIT_TARGET_INCLUDE"
+                or (
+                    species.exclusion_override
+                    and not species.explicit_include
+                )
+            )
+        )
+
+        result[taxid] = AssemblySelectionConstraints(
+            include_accessions=frozenset(
+                include_accessions.get(
+                    taxid,
+                    set(),
+                )
+            ),
+            include_strains=frozenset(
+                include_strains.get(
+                    taxid,
+                    set(),
+                )
+            ),
+            exclude_accessions=frozenset(
+                exclude_accessions.get(
+                    taxid,
+                    set(),
+                )
+            ),
+            exclude_strains=frozenset(
+                exclude_strains.get(
+                    taxid,
+                    set(),
+                )
+            ),
+            automatic_selection_enabled=(
+                not target_only_species
+            ),
+        )
+
+    return result
+
+
 @dataclass
 class AssemblySelectionExecution:
     selected_accessions: set[str]
@@ -5584,6 +7754,7 @@ def execute_assembly_selection(
     assemblies: Sequence[AssemblyRecord],
     policy: AssemblySelectionPolicy,
     evaluate: Callable[[AssemblyRecord], bool],
+    constraints: AssemblySelectionConstraints | None = None,
 ) -> AssemblySelectionExecution:
     """Execute one deterministic assembly-selection policy.
 
@@ -5601,13 +7772,77 @@ def execute_assembly_selection(
     assembly simultaneously represents a strain and one of its isolates.
     """
 
-    ordered = sorted(
+    ordered_all = sorted(
         assemblies,
         key=quality_rank_key,
     )
 
+    active_constraints = (
+        constraints
+        if constraints is not None
+        else AssemblySelectionConstraints()
+    )
+
+    validate_assembly_selection_constraints(
+        ordered_all,
+        active_constraints,
+    )
+
     outcomes: dict[str, bool] = {}
     not_selected: dict[str, str] = {}
+
+    ordered: list[AssemblyRecord] = []
+
+    for assembly in ordered_all:
+
+        accession = assembly.accession
+        strain_key = strain_selection_key(
+            assembly
+        )
+
+        if accession in active_constraints.exclude_accessions:
+
+            not_selected[accession] = (
+                "EXPLICIT_ASSEMBLY_EXCLUDED"
+            )
+
+            continue
+
+        if (
+            strain_key is not None
+            and strain_key in active_constraints.exclude_strains
+        ):
+
+            not_selected[accession] = (
+                "EXPLICIT_STRAIN_EXCLUDED"
+            )
+
+            continue
+
+        explicit_target_member = (
+            accession
+            in active_constraints.include_accessions
+            or (
+                strain_key is not None
+                and strain_key
+                in active_constraints.include_strains
+            )
+        )
+
+        if (
+            not active_constraints.automatic_selection_enabled
+            and not explicit_target_member
+        ):
+
+            not_selected[accession] = (
+                "OUTSIDE_EXPLICIT_TARGET_SCOPE"
+            )
+
+            continue
+
+        ordered.append(
+            assembly
+        )
 
     represented_strains: set[str] = set()
 
@@ -5653,6 +7888,119 @@ def execute_assembly_selection(
 
         return usable
 
+    by_accession = {
+        assembly.accession: assembly
+        for assembly in ordered
+    }
+
+    # ------------------------------------------------------------------
+    # Exact explicit assembly inclusions.
+    # ------------------------------------------------------------------
+    explicit_assemblies = sorted(
+        (
+            by_accession[accession]
+            for accession
+            in active_constraints.include_accessions
+        ),
+        key=quality_rank_key,
+    )
+
+    for assembly in explicit_assemblies:
+
+        if evaluate_once(
+            assembly
+        ):
+
+            strain_key = strain_selection_key(
+                assembly
+            )
+
+            if strain_key is not None:
+                represented_strains.add(
+                    strain_key
+                )
+
+    # ------------------------------------------------------------------
+    # Explicit strain inclusions.
+    # ------------------------------------------------------------------
+    #
+    # In normal STRAIN mode an explicitly requested strain uses the same
+    # per-strain assembly depth as an automatic strain. In compact SPECIES
+    # mode there is no per-strain depth setting, so the explicit strain means
+    # one best usable representative.
+    explicit_strain_depth = (
+        policy.max_assemblies_per_strain
+        if policy.mode == "STRAIN"
+        else 1
+    )
+
+    if explicit_strain_depth is None:
+        explicit_strain_depth = 1
+
+    explicit_strain_records: dict[
+        str,
+        list[AssemblyRecord],
+    ] = defaultdict(list)
+
+    for assembly in ordered:
+
+        strain_key = strain_selection_key(
+            assembly
+        )
+
+        if (
+            strain_key is not None
+            and strain_key
+            in active_constraints.include_strains
+        ):
+
+            explicit_strain_records[
+                strain_key
+            ].append(assembly)
+
+    for records in explicit_strain_records.values():
+        records.sort(
+            key=quality_rank_key
+        )
+
+    ranked_explicit_strains = sorted(
+        explicit_strain_records.items(),
+        key=lambda item: quality_rank_key(
+            item[1][0]
+        ),
+    )
+
+    for strain_key, strain_records in ranked_explicit_strains:
+
+        usable_in_strain = sum(
+            outcomes.get(
+                assembly.accession
+            )
+            is True
+            for assembly in strain_records
+        )
+
+        for assembly in strain_records:
+
+            if (
+                usable_in_strain
+                >= explicit_strain_depth
+            ):
+                break
+
+            if assembly.accession in outcomes:
+                continue
+
+            if evaluate_once(
+                assembly
+            ):
+                usable_in_strain += 1
+
+        if usable_in_strain:
+            represented_strains.add(
+                strain_key
+            )
+
     # ------------------------------------------------------------------
     # Compact species-level mode.
     # ------------------------------------------------------------------
@@ -5665,19 +8013,74 @@ def execute_assembly_selection(
 
         successful = 0
 
+        if active_constraints.automatic_selection_enabled:
+
+            for assembly in ordered:
+
+                accession = assembly.accession
+                strain_key = strain_selection_key(
+                    assembly
+                )
+
+                # Explicit objects are additions to the automatic quota.
+                if (
+                    accession
+                    in active_constraints.include_accessions
+                    or (
+                        strain_key is not None
+                        and strain_key
+                        in active_constraints.include_strains
+                    )
+                ):
+                    continue
+
+                if (
+                    successful
+                    >= policy.max_assemblies_per_species
+                ):
+
+                    not_selected[accession] = (
+                        "MAX_ASSEMBLIES_PER_SPECIES"
+                    )
+
+                    continue
+
+                if evaluate_once(
+                    assembly
+                ):
+                    successful += 1
+
         for assembly in ordered:
 
-            if (
-                successful
-                >= policy.max_assemblies_per_species
-            ):
-                not_selected[assembly.accession] = (
-                    "MAX_ASSEMBLIES_PER_SPECIES"
-                )
+            accession = assembly.accession
+
+            if accession in outcomes:
                 continue
 
-            if evaluate_once(assembly):
-                successful += 1
+            if accession in not_selected:
+                continue
+
+            strain_key = strain_selection_key(
+                assembly
+            )
+
+            if (
+                strain_key is not None
+                and strain_key
+                in active_constraints.include_strains
+            ):
+                reason = (
+                    "EXPLICIT_STRAIN_ALREADY_REPRESENTED"
+                )
+
+            else:
+                reason = (
+                    "MAX_ASSEMBLIES_PER_SPECIES"
+                )
+
+            not_selected[
+                accession
+            ] = reason
 
         return AssemblySelectionExecution(
             selected_accessions={
@@ -5765,19 +8168,137 @@ def execute_assembly_selection(
         ),
     )
 
+    automatic_represented_strains: set[str] = set()
+
+
     # ------------------------------------------------------------------
-    # Strain-level representation.
+    # Isolate expansion helper for represented strains.
+    # ------------------------------------------------------------------
+    def expand_isolates_for_strain(
+        strain_records: Sequence[AssemblyRecord],
+    ) -> None:
+
+        if not policy.include_isolates:
+            return
+
+        within_strain_isolates: dict[
+            tuple[str | None, str],
+            list[AssemblyRecord],
+        ] = defaultdict(list)
+
+        for assembly in strain_records:
+
+            isolate_key = isolate_selection_key(
+                assembly
+            )
+
+            if isolate_key is not None:
+
+                within_strain_isolates[
+                    isolate_key
+                ].append(assembly)
+
+        eligible_isolates.update(
+            within_strain_isolates
+        )
+
+        for records in within_strain_isolates.values():
+            records.sort(
+                key=quality_rank_key
+            )
+
+        ranked_isolates = sorted(
+            within_strain_isolates.items(),
+            key=lambda item: quality_rank_key(
+                item[1][0]
+            ),
+        )
+
+        for isolate_key, isolate_records in ranked_isolates:
+
+            already_represented = any(
+                outcomes.get(
+                    assembly.accession
+                )
+                is True
+                for assembly in isolate_records
+            )
+
+            if already_represented:
+
+                represented_isolates.add(
+                    isolate_key
+                )
+
+                continue
+
+            for assembly in isolate_records:
+
+                if evaluate_once(
+                    assembly
+                ):
+
+                    represented_isolates.add(
+                        isolate_key
+                    )
+
+                    break
+
+    # Explicit assembly/strain inclusions may already have represented strains
+    # before the automatic strain quota begins. If isolate expansion is active,
+    # those strains participate exactly like automatically represented strains.
+    for strain_key in sorted(
+        represented_strains
+    ):
+
+        records = strain_groups.get(
+            strain_key
+        )
+
+        if records:
+            expand_isolates_for_strain(
+                records
+            )
+
+    # ------------------------------------------------------------------
+    # Automatic strain-level representation.
     # ------------------------------------------------------------------
     for strain_key, strain_records in ranked_strains:
 
+        # An explicitly included strain is additional to max-strains and must
+        # therefore not consume one of the automatic strain slots.
+        if strain_key in active_constraints.include_strains:
+            continue
+
+        # Exact explicitly included assemblies are also additive. They do not
+        # consume the normal per-strain assembly quota.
+        automatic_strain_records = [
+            assembly
+            for assembly in strain_records
+            if assembly.accession
+            not in active_constraints.include_accessions
+        ]
+
+        if not automatic_strain_records:
+            continue
+
+        if (
+            not active_constraints.automatic_selection_enabled
+        ):
+            continue
+
         if (
             policy.max_strains_per_species is not None
-            and len(represented_strains)
+            and len(
+                automatic_represented_strains
+            )
             >= policy.max_strains_per_species
         ):
 
-            for assembly in strain_records:
+            for assembly in automatic_strain_records:
+
                 if assembly.accession not in outcomes:
+
                     not_selected[assembly.accession] = (
                         "MAX_STRAINS_PER_SPECIES"
                     )
@@ -5786,7 +8307,7 @@ def execute_assembly_selection(
 
         usable_in_strain = 0
 
-        for assembly in strain_records:
+        for assembly in automatic_strain_records:
 
             if (
                 usable_in_strain
@@ -5794,87 +8315,28 @@ def execute_assembly_selection(
             ):
                 break
 
-            if evaluate_once(assembly):
+            if evaluate_once(
+                assembly
+            ):
                 usable_in_strain += 1
 
         if usable_in_strain == 0:
 
-            # All candidates in this strain were evaluated and none produced
-            # usable protein data. The strain does not consume a strain slot.
+            # A completely failed automatic strain still does not consume a
+            # max-strains slot.
             continue
 
         represented_strains.add(
             strain_key
         )
 
-        # --------------------------------------------------------------
-        # Optional isolate expansion inside a represented strain.
-        # --------------------------------------------------------------
-        if policy.include_isolates:
+        automatic_represented_strains.add(
+            strain_key
+        )
 
-            within_strain_isolates: dict[
-                tuple[str | None, str],
-                list[AssemblyRecord],
-            ] = defaultdict(list)
-
-            for assembly in strain_records:
-
-                isolate_key = isolate_selection_key(
-                    assembly
-                )
-
-                if isolate_key is not None:
-
-                    within_strain_isolates[
-                        isolate_key
-                    ].append(assembly)
-
-            eligible_isolates.update(
-                within_strain_isolates
-            )
-
-            for records in within_strain_isolates.values():
-                records.sort(
-                    key=quality_rank_key
-                )
-
-            ranked_isolates = sorted(
-                within_strain_isolates.items(),
-                key=lambda item: quality_rank_key(
-                    item[1][0]
-                ),
-            )
-
-            for isolate_key, isolate_records in ranked_isolates:
-
-                # The strain representative may already satisfy this isolate.
-                already_represented = any(
-                    outcomes.get(
-                        assembly.accession
-                    )
-                    is True
-                    for assembly in isolate_records
-                )
-
-                if already_represented:
-
-                    represented_isolates.add(
-                        isolate_key
-                    )
-
-                    continue
-
-                for assembly in isolate_records:
-
-                    # Previously failed strain candidates are not downloaded
-                    # again. evaluate_once() returns the cached failure.
-                    if evaluate_once(assembly):
-
-                        represented_isolates.add(
-                            isolate_key
-                        )
-
-                        break
+        expand_isolates_for_strain(
+            strain_records
+        )
 
     # ------------------------------------------------------------------
     # Isolate-labelled records without strain assignment.
@@ -5966,7 +8428,10 @@ def execute_assembly_selection(
     # Candidates deliberately skipped by the normal strain policy may already
     # carry a provisional NOT_SELECTED reason. Remove that reason only when
     # the candidate is actually promoted into this fallback attempt.
-    if not any(outcomes.values()):
+    if (
+        active_constraints.automatic_selection_enabled
+        and not any(outcomes.values())
+    ):
 
         for assembly in ordered:
 
@@ -6012,9 +8477,17 @@ def execute_assembly_selection(
 
             if (
                 strain_key
-                not in represented_strains
+                in active_constraints.include_strains
+            ):
+                reason = "MAX_ASSEMBLIES_PER_STRAIN"
+
+            elif (
+                strain_key
+                not in automatic_represented_strains
                 and policy.max_strains_per_species is not None
-                and len(represented_strains)
+                and len(
+                    automatic_represented_strains
+                )
                 >= policy.max_strains_per_species
             ):
                 reason = "MAX_STRAINS_PER_SPECIES"
@@ -6094,27 +8567,137 @@ def insert_species_rows(state: StateDB, species_map: Mapping[int, SpeciesCandida
             )
 
 
-def apply_species_filters(state: StateDB, species_map: dict[int, SpeciesCandidate], rules: Sequence[FilterRule]) -> dict[int, SpeciesCandidate]:
-    species_rules = [r for r in rules if r.level == "species"]
+def apply_species_filters(
+    state: StateDB,
+    species_map: dict[int, SpeciesCandidate],
+    rules: Sequence[FilterRule],
+    *,
+    required_taxids: set[int] | None = None,
+) -> dict[int, SpeciesCandidate]:
+
+    species_rules = [
+        r
+        for r in rules
+        if r.level == "species"
+    ]
+
+    required = (
+        required_taxids
+        if required_taxids is not None
+        else set()
+    )
     if not species_rules:
+
         with state.conn:
-            state.conn.execute("UPDATE species SET filter_status='PASS' WHERE final_taxonomic_status='INCLUDED'")
+            state.conn.execute(
+                "UPDATE species "
+                "SET filter_status='PASS' "
+                "WHERE final_taxonomic_status='INCLUDED'"
+            )
+
         return species_map
+
     kept: dict[int, SpeciesCandidate] = {}
+
+    required_failures: list[
+        tuple[
+            SpeciesCandidate,
+            list[dict[str, Any]],
+        ]
+    ] = []
+
     with state.conn:
+
         for taxid, species in species_map.items():
-            failures = apply_filters_to_entity(species, species_rules)
+
+            failures = apply_filters_to_entity(
+                species,
+                species_rules,
+            )
+
             if failures:
-                state.conn.execute("UPDATE species SET filter_status='FAIL' WHERE taxid=?", (taxid,))
+
+                state.conn.execute(
+                    "UPDATE species "
+                    "SET filter_status='FAIL' "
+                    "WHERE taxid=?",
+                    (taxid,),
+                )
+
                 for f in failures:
+
                     state.conn.execute(
-                        """INSERT INTO species_filter_failures(species_taxid,species,filter_id,field,operator,required,observed,failure_reason)
-                           VALUES(?,?,?,?,?,?,?,?)""",
-                        (taxid,species.species,f["Filter_ID"],f["Field"],f["Operator"],f["Required"],f["Observed"],f["Failure_reason"]),
+                        """
+                        INSERT INTO species_filter_failures(
+                            species_taxid,
+                            species,
+                            filter_id,
+                            field,
+                            operator,
+                            required,
+                            observed,
+                            failure_reason
+                        )
+                        VALUES(?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            taxid,
+                            species.species,
+                            f["Filter_ID"],
+                            f["Field"],
+                            f["Operator"],
+                            f["Required"],
+                            f["Observed"],
+                            f["Failure_reason"],
+                        ),
                     )
+
+                if taxid in required:
+                    required_failures.append(
+                        (
+                            species,
+                            failures,
+                        )
+                    )
+
             else:
-                state.conn.execute("UPDATE species SET filter_status='PASS' WHERE taxid=?", (taxid,))
+
+                state.conn.execute(
+                    "UPDATE species "
+                    "SET filter_status='PASS' "
+                    "WHERE taxid=?",
+                    (taxid,),
+                )
+
                 kept[taxid] = species
+
+    if required_failures:
+
+        details: list[str] = []
+
+        for species, failures in required_failures:
+
+            failed_filter_ids = ", ".join(
+                str(f["Filter_ID"])
+                for f in failures
+            )
+
+            details.append(
+                f"{species.species} "
+                f"(TaxID {species.taxid}): "
+                f"{failed_filter_ids}"
+            )
+
+        raise ConfigError(
+            "One or more species required by explicit inclusion targets "
+            "failed active species metadata filters. Explicit targets do not "
+            "bypass metadata filters.\n"
+            + "\n".join(
+                f"  - {detail}"
+                for detail in details
+            )
+        )
+
     return kept
 
 
@@ -6226,6 +8809,7 @@ def build_assembly_inventory(
     species_map: Mapping[int, SpeciesCandidate],
     config: BuildConfig,
     all_filter_rules: Sequence[FilterRule],
+    explicit_include_targets: Sequence[ResolvedExplicitTarget] = (),
 ) -> dict[int, list[AssemblyRecord]]:
 
     assembly_rules = [
@@ -6261,6 +8845,15 @@ def build_assembly_inventory(
             species,
         )
 
+        (
+            records,
+            required_explicit_accessions,
+        ) = merge_explicit_assembly_targets_into_inventory(
+            records,
+            species.taxid,
+            explicit_include_targets,
+        )
+
         inventory_by_accession = {
             a.accession: a
             for a in records
@@ -6292,6 +8885,8 @@ def build_assembly_inventory(
             if a.multi_isolate
         )
 
+        explicit_target_rejections: list[str] = []
+
         with state.conn:
 
             for assembly_number, a in enumerate(records, start=1):
@@ -6307,6 +8902,9 @@ def build_assembly_inventory(
                     a,
                     inventory_by_accession,
                     config,
+                    explicit_include_accessions=(
+                        required_explicit_accessions
+                    ),
                 )
 
                 a.source_scope_status = (
@@ -6326,6 +8924,15 @@ def build_assembly_inventory(
                         ASSEMBLY_INSERT_SQL,
                         assembly_to_db_tuple(a),
                     )
+
+                    if (
+                        a.accession
+                        in required_explicit_accessions
+                    ):
+                        explicit_target_rejections.append(
+                            f"{a.accession}: source-scope rejection "
+                            f"({scope_reason})"
+                        )
 
                     if config.verbose:
                         assembly_inventory_result_block(
@@ -6391,6 +8998,15 @@ def build_assembly_inventory(
                             hard_reason,
                         ),
                     )
+
+                    if (
+                        a.accession
+                        in required_explicit_accessions
+                    ):
+                        explicit_target_rejections.append(
+                            f"{a.accession}: hard assembly QC failed "
+                            f"({hard_reason})"
+                        )
 
                     if config.verbose:
                         assembly_inventory_result_block(
@@ -6458,6 +9074,20 @@ def build_assembly_inventory(
                             ),
                         )
 
+                    if (
+                        a.accession
+                        in required_explicit_accessions
+                    ):
+                        failed_filter_ids = ", ".join(
+                            str(f["Filter_ID"])
+                            for f in failures
+                        )
+
+                        explicit_target_rejections.append(
+                            f"{a.accession}: active assembly metadata "
+                            f"filter(s) failed ({failed_filter_ids})"
+                        )
+
                     if config.verbose:
                         failed_filter_ids = ", ".join(
                             str(f["Filter_ID"])
@@ -6518,6 +9148,20 @@ def build_assembly_inventory(
                             ),
                         ],
                     )
+
+        if explicit_target_rejections:
+
+            raise ConfigError(
+                "One or more explicitly included assembly targets failed "
+                "mandatory assembly eligibility checks. Explicit targets may "
+                "override automatic GCA source-scope policy, but they do not "
+                "bypass hard assembly QC or active assembly metadata filters.\n"
+                + "\n".join(
+                    f"  - {detail}"
+                    for detail
+                    in explicit_target_rejections
+                )
+            )
 
         # Protein FASTA availability is only known after downloading an assembly.
         # Therefore biological depth selection is deliberately deferred to the
@@ -6763,6 +9407,7 @@ class WorkerJob:
     species: SpeciesCandidate
     assemblies: list[AssemblyRecord]
     selection_policy: AssemblySelectionPolicy | None
+    selection_constraints: AssemblySelectionConstraints | None
     temp_base: str
     ready_dir: str
 
@@ -7617,6 +10262,7 @@ def process_species_worker(job: WorkerJob) -> WorkerResult:
                     job.assemblies,
                     job.selection_policy,
                     evaluate_candidate,
+                    constraints=job.selection_constraints,
                 )
 
                 # Every deliberately non-attempted candidate must still receive
@@ -8809,6 +11455,10 @@ def run_species_workers(
     work_root: Path,
     resource_plan: ResourcePlan,
     *,
+    selection_constraints_by_species: Mapping[
+        int,
+        AssemblySelectionConstraints,
+    ] | None = None,
     update_mode: bool = False,
 ) -> None:
     ready_dir = work_root / TMP_DIR / "prepared_species"
@@ -8874,6 +11524,12 @@ def run_species_workers(
         else assembly_selection_policy(config)
     )
 
+    worker_selection_constraints = (
+        selection_constraints_by_species
+        if selection_constraints_by_species is not None
+        else {}
+    )
+
     for taxid, species in sorted(species_map.items(), key=lambda kv: (kv[1].species, kv[0])):
         assemblies = pools.get(taxid, [])
         if not assemblies:
@@ -8897,6 +11553,15 @@ def run_species_workers(
                 # The final update selection is performed later against the combined pool of
                 # reusable + newly processed candidates.
                 selection_policy=worker_selection_policy,
+
+                selection_constraints=(
+                    None
+                    if update_mode
+                    else worker_selection_constraints.get(
+                        taxid,
+                        AssemblySelectionConstraints(),
+                    )
+                ),
 
                 temp_base=str(temp_base),
                 ready_dir=str(ready_dir),
@@ -9099,6 +11764,11 @@ def finalize_update_selection(
     reusable: Mapping[int, set[str]],
     old: OldReference,
     config: BuildConfig,
+    *,
+    selection_constraints_by_species: Mapping[
+        int,
+        AssemblySelectionConstraints,
+    ] | None = None,
 ) -> None:
     """Resolve the final update selection after protein availability is known.
 
@@ -9108,6 +11778,12 @@ def finalize_update_selection(
 
     policy = assembly_selection_policy(
         config
+    )
+
+    active_constraints_by_species = (
+        selection_constraints_by_species
+        if selection_constraints_by_species is not None
+        else {}
     )
 
     reportable_taxids = {
@@ -9165,6 +11841,12 @@ def finalize_update_selection(
             lambda assembly: (
                 assembly.accession
                 in usable_accessions
+            ),
+            constraints=(
+                active_constraints_by_species.get(
+                    taxid,
+                    AssemblySelectionConstraints(),
+                )
             ),
         )
 
@@ -10157,9 +12839,19 @@ def calculate_assembly_coverage_metrics(
             row["qc_status"] == "PASS"
         )
 
+        # Source/QC eligibility is not sufficient when explicit biological
+        # constraints narrow the active selection scope. Assemblies deliberately
+        # removed by an exact assembly exclusion, a strain exclusion, or a
+        # target-only species boundary must not inflate coverage denominators.
+        selection_scope_pass = (
+            row["final_reason"]
+            not in EXPLICIT_SELECTION_SCOPE_EXCLUSION_REASONS
+        )
+
         eligible = (
             source_scope_pass
             and qc_pass
+            and selection_scope_pass
         )
 
         excluded_gca = (
@@ -10312,6 +13004,543 @@ def calculate_assembly_coverage_metrics(
             assemblies_not_selected
         ),
     )
+
+
+@dataclass(frozen=True)
+class ExplicitTargetOutcome:
+    """Final observed outcome of one resolved explicit biological target."""
+
+    target: ResolvedExplicitTarget = field(
+        compare=False,
+        repr=False,
+    )
+
+    status: str
+
+    matched_accessions: tuple[str, ...]
+    selected_usable_accessions: tuple[str, ...]
+
+    reason: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class ExplicitTargetOutcomeMetrics:
+    include_total: int = 0
+    include_fulfilled: int = 0
+    include_unfulfilled: int = 0
+
+    exclude_total: int = 0
+    exclude_applied: int = 0
+    exclude_not_applicable: int = 0
+
+
+def explicit_target_matching_assembly_rows(
+    conn: sqlite3.Connection,
+    target: ResolvedExplicitTarget,
+) -> list[sqlite3.Row]:
+    """Return final assembly rows belonging to one resolved target."""
+
+    rows = conn.execute(
+        """
+        SELECT
+            accession,
+            species_taxid,
+            strain,
+            source_scope_status,
+            qc_status,
+            selected,
+            protein_fasta_available,
+            final_status,
+            final_reason
+        FROM assemblies
+        WHERE species_taxid=?
+        ORDER BY accession
+        """,
+        (
+            target.species_taxid,
+        ),
+    ).fetchall()
+
+    if target.rule.target_type == "assembly":
+
+        if target.assembly_accession is None:
+            raise DataIntegrityError(
+                "Resolved explicit assembly target has no assembly accession."
+            )
+
+        return [
+            row
+            for row in rows
+            if row["accession"]
+            == target.assembly_accession
+        ]
+
+    if target.rule.target_type == "strain":
+
+        if target.strain_key is None:
+            raise DataIntegrityError(
+                "Resolved explicit strain target has no normalized strain key."
+            )
+
+        return [
+            row
+            for row in rows
+            if normalize_selection_label(
+                row["strain"]
+            )
+            == target.strain_key
+        ]
+
+    raise DataIntegrityError(
+        "Unsupported resolved explicit target type during final reporting: "
+        f"{target.rule.target_type!r}."
+    )
+
+
+def explicit_target_failure_detail(
+    conn: sqlite3.Connection,
+    species_taxid: int,
+    accessions: Sequence[str],
+) -> str:
+    """Summarize persisted protein-retrieval details for target assemblies."""
+
+    unique_accessions = sorted(
+        set(accessions)
+    )
+
+    if not unique_accessions:
+        return "."
+
+    placeholders = ",".join(
+        "?"
+        for _ in unique_accessions
+    )
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            assembly,
+            reason,
+            detail
+        FROM failed_downloads
+        WHERE species_taxid=?
+          AND assembly IN ({placeholders})
+        ORDER BY assembly, id
+        """,
+        (
+            species_taxid,
+            *unique_accessions,
+        ),
+    ).fetchall()
+
+    details: list[str] = []
+
+    for row in rows:
+
+        reason = (
+            normalize_missing(
+                row["reason"]
+            )
+            or "UNKNOWN_FAILURE"
+        )
+
+        detail = normalize_missing(
+            row["detail"]
+        )
+
+        rendered = (
+            f"{row['assembly']}: {reason}"
+        )
+
+        if detail is not None:
+            rendered += f" ({detail})"
+
+        details.append(
+            rendered
+        )
+
+    if not details:
+        return "."
+
+    return " | ".join(
+        dict.fromkeys(details)
+    )
+
+
+def explicit_target_unfulfilled_reason(
+    rows: Sequence[sqlite3.Row],
+) -> str:
+    """Return the most informative persisted reason for an include failure."""
+
+    eligible_rows = [
+        row
+        for row in rows
+        if (
+            row["source_scope_status"] == "PASS"
+            and row["qc_status"] == "PASS"
+        )
+    ]
+
+    assessed_rows = [
+        row
+        for row in eligible_rows
+        if row["final_status"]
+        != "NOT_SELECTED"
+    ]
+
+    reason_rows = (
+        assessed_rows
+        or eligible_rows
+        or list(rows)
+    )
+
+    reasons = sorted({
+        reason
+        for row in reason_rows
+        if (
+            reason := normalize_missing(
+                row["final_reason"]
+            )
+        )
+        is not None
+    })
+
+    if reasons:
+        return ";".join(reasons)
+
+    return "NO_USABLE_SELECTED_PROTEIN"
+
+
+def calculate_explicit_target_outcomes(
+    conn: sqlite3.Connection,
+    targets: Sequence[ResolvedExplicitTarget],
+) -> list[ExplicitTargetOutcome]:
+    """Derive target fulfillment strictly from final persistent assembly state."""
+
+    outcomes: list[
+        ExplicitTargetOutcome
+    ] = []
+
+    for target in targets:
+
+        rows = explicit_target_matching_assembly_rows(
+            conn,
+            target,
+        )
+
+        matched_accessions = tuple(
+            row["accession"]
+            for row in rows
+        )
+
+        selected_usable = tuple(
+            row["accession"]
+            for row in rows
+            if (
+                bool(row["selected"])
+                and bool(
+                    row["protein_fasta_available"]
+                )
+            )
+        )
+
+        action = target.rule.action
+
+        # --------------------------------------------------------------
+        # INCLUDE
+        # --------------------------------------------------------------
+        if action == "include":
+
+            # Explicit includes have already passed mandatory taxonomy,
+            # assembly-scope/QC/filter and constraint validation. Reaching final
+            # reporting without any corresponding assembly state is therefore an
+            # internal consistency failure, not an ordinary unfulfilled target.
+            if not rows:
+                raise DataIntegrityError(
+                    "Final state is missing assembly records for explicitly "
+                    f"included {target.rule.target_type} target: "
+                    f"{target.species} (TaxID {target.species_taxid})."
+                )
+
+            if selected_usable:
+
+                outcomes.append(
+                    ExplicitTargetOutcome(
+                        target=target,
+                        status="FULFILLED",
+                        matched_accessions=matched_accessions,
+                        selected_usable_accessions=selected_usable,
+                        reason="SELECTED_USABLE_PROTEIN",
+                        detail=".",
+                    )
+                )
+
+                continue
+
+            reason = explicit_target_unfulfilled_reason(
+                rows
+            )
+
+            detail = explicit_target_failure_detail(
+                conn,
+                target.species_taxid,
+                matched_accessions,
+            )
+
+            outcomes.append(
+                ExplicitTargetOutcome(
+                    target=target,
+                    status="UNFULFILLED",
+                    matched_accessions=matched_accessions,
+                    selected_usable_accessions=(),
+                    reason=reason,
+                    detail=detail,
+                )
+            )
+
+            continue
+
+        # --------------------------------------------------------------
+        # EXCLUDE
+        # --------------------------------------------------------------
+        if action == "exclude":
+
+            selected_rows = [
+                row
+                for row in rows
+                if bool(
+                    row["selected"]
+                )
+            ]
+
+            if selected_rows:
+
+                selected_text = ", ".join(
+                    row["accession"]
+                    for row in selected_rows
+                )
+
+                raise DataIntegrityError(
+                    "Explicit exclusion constraint was violated by the final "
+                    f"selection: {selected_text}."
+                )
+
+            eligible_matching_rows = [
+                row
+                for row in rows
+                if (
+                    row["source_scope_status"]
+                    == "PASS"
+                    and row["qc_status"]
+                    == "PASS"
+                )
+            ]
+
+            if eligible_matching_rows:
+
+                expected_reason = (
+                    "EXPLICIT_ASSEMBLY_EXCLUDED"
+                    if target.rule.target_type
+                    == "assembly"
+                    else "EXPLICIT_STRAIN_EXCLUDED"
+                )
+
+                outcomes.append(
+                    ExplicitTargetOutcome(
+                        target=target,
+                        status="APPLIED",
+                        matched_accessions=matched_accessions,
+                        selected_usable_accessions=(),
+                        reason=expected_reason,
+                        detail=".",
+                    )
+                )
+
+            else:
+
+                # The exclusion was valid but had nothing eligible to remove
+                # from the active build. Report this explicitly rather than
+                # implying that it changed the final selection.
+                outcomes.append(
+                    ExplicitTargetOutcome(
+                        target=target,
+                        status="NOT_APPLICABLE",
+                        matched_accessions=matched_accessions,
+                        selected_usable_accessions=(),
+                        reason=(
+                            "NO_ELIGIBLE_MATCH_IN_ACTIVE_BUILD"
+                        ),
+                        detail=".",
+                    )
+                )
+
+            continue
+
+        raise DataIntegrityError(
+            "Unsupported explicit target action during final reporting: "
+            f"{action!r}."
+        )
+
+    return outcomes
+
+
+def explicit_target_outcome_metrics(
+    outcomes: Sequence[ExplicitTargetOutcome],
+) -> ExplicitTargetOutcomeMetrics:
+    """Summarize final explicit-target outcomes."""
+
+    include_outcomes = [
+        outcome
+        for outcome in outcomes
+        if outcome.target.rule.action
+        == "include"
+    ]
+
+    exclude_outcomes = [
+        outcome
+        for outcome in outcomes
+        if outcome.target.rule.action
+        == "exclude"
+    ]
+
+    return ExplicitTargetOutcomeMetrics(
+        include_total=len(
+            include_outcomes
+        ),
+        include_fulfilled=sum(
+            outcome.status == "FULFILLED"
+            for outcome in include_outcomes
+        ),
+        include_unfulfilled=sum(
+            outcome.status == "UNFULFILLED"
+            for outcome in include_outcomes
+        ),
+        exclude_total=len(
+            exclude_outcomes
+        ),
+        exclude_applied=sum(
+            outcome.status == "APPLIED"
+            for outcome in exclude_outcomes
+        ),
+        exclude_not_applicable=sum(
+            outcome.status == "NOT_APPLICABLE"
+            for outcome in exclude_outcomes
+        ),
+    )
+
+
+def write_explicit_targets_report(
+    state: StateDB,
+    work_root: Path,
+    targets: Sequence[ResolvedExplicitTarget],
+) -> ExplicitTargetOutcomeMetrics:
+    """Write final explicit-target outcomes and explain incomplete fulfillment."""
+
+    outcomes = calculate_explicit_target_outcomes(
+        state.conn,
+        targets,
+    )
+
+    fields = [
+        "Action",
+        "Target_type",
+        "Species",
+        "Taxid",
+        "Strain",
+        "Assembly_accession",
+        "Status",
+        "Matched_assemblies",
+        "Selected_usable_assemblies",
+        "Reason",
+        "Detail",
+        "Evidence_type",
+        "Notes",
+        "Input_file",
+        "Input_line",
+    ]
+
+    rows = []
+
+    for outcome in outcomes:
+
+        target = outcome.target
+        rule = target.rule
+
+        rows.append({
+            "Action": rule.action.upper(),
+            "Target_type": rule.target_type.upper(),
+            "Species": target.species,
+            "Taxid": target.species_taxid,
+            "Strain": value_tsv(target.strain),
+            "Assembly_accession": value_tsv(
+                target.assembly_accession
+            ),
+            "Status": outcome.status,
+            "Matched_assemblies": (
+                ";".join(
+                    outcome.matched_accessions
+                )
+                or "."
+            ),
+            "Selected_usable_assemblies": (
+                ";".join(
+                    outcome.selected_usable_accessions
+                )
+                or "."
+            ),
+            "Reason": outcome.reason,
+            "Detail": outcome.detail,
+            "Evidence_type": value_tsv(
+                rule.evidence_type
+            ),
+            "Notes": value_tsv(
+                rule.notes
+            ),
+            "Input_file": rule.input_path,
+            "Input_line": rule.input_line,
+        })
+
+    write_tsv(
+        work_root
+        / REPORTS_DIR
+        / "explicit_targets.tsv",
+        fields,
+        rows,
+    )
+
+    metrics = explicit_target_outcome_metrics(
+        outcomes
+    )
+
+    if outcomes:
+
+        info(
+            "Explicit target outcomes: "
+            f"includes fulfilled "
+            f"{metrics.include_fulfilled}/{metrics.include_total}; "
+            f"exclusions applied "
+            f"{metrics.exclude_applied}/{metrics.exclude_total}"
+            + (
+                f"; exclusions not applicable "
+                f"{metrics.exclude_not_applicable}"
+                if metrics.exclude_not_applicable
+                else ""
+            )
+            + "."
+        )
+
+    if metrics.include_unfulfilled:
+
+        warn(
+            f"{metrics.include_unfulfilled} explicitly included target(s) "
+            "could not be fulfilled with usable selected protein data. "
+            "The reference can still complete, but these requested targets "
+            "are not represented as requested. See "
+            "reports/explicit_targets.tsv for exact reasons."
+        )
+
+    return metrics
 
 
 def write_species_without_protein_report(
@@ -10653,7 +13882,14 @@ def write_assemblies_master(state: StateDB, work_root: Path, config: BuildConfig
     write_xlsx_from_tsv(tsv, work_root / METADATA_DIR / "fungal_assemblies_master.xlsx")
 
 
-def write_build_summary(state: StateDB, work_root: Path, config: BuildConfig, plan: ResourcePlan) -> None:
+def write_build_summary(
+    state: StateDB,
+    work_root: Path,
+    config: BuildConfig,
+    plan: ResourcePlan,
+    *,
+    explicit_target_metrics: ExplicitTargetOutcomeMetrics | None = None,
+) -> None:
     """Write a compact key/value summary that is easy to inspect or parse."""
     selected_species = int(state.conn.execute("SELECT COUNT(DISTINCT species_taxid) FROM sources").fetchone()[0])
     selected_assemblies = int(state.conn.execute("SELECT COUNT(*) FROM assemblies WHERE selected=1").fetchone()[0])
@@ -10690,6 +13926,11 @@ def write_build_summary(state: StateDB, work_root: Path, config: BuildConfig, pl
     coverage = calculate_assembly_coverage_metrics(
         state.conn
     )
+
+    if explicit_target_metrics is None:
+        explicit_target_metrics = (
+            ExplicitTargetOutcomeMetrics()
+        )
 
     if policy.mode == "SPECIES":
 
@@ -10805,6 +14046,30 @@ def write_build_summary(state: StateDB, work_root: Path, config: BuildConfig, pl
             "Assemblies_not_selected_by_biological_selection_policy",
             coverage.assemblies_not_selected_by_policy,
         ),
+                (
+            "Explicit_include_targets_total",
+            explicit_target_metrics.include_total,
+        ),
+        (
+            "Explicit_include_targets_fulfilled",
+            explicit_target_metrics.include_fulfilled,
+        ),
+        (
+            "Explicit_include_targets_unfulfilled",
+            explicit_target_metrics.include_unfulfilled,
+        ),
+        (
+            "Explicit_exclude_targets_total",
+            explicit_target_metrics.exclude_total,
+        ),
+        (
+            "Explicit_exclude_targets_applied",
+            explicit_target_metrics.exclude_applied,
+        ),
+        (
+            "Explicit_exclude_targets_not_applicable",
+            explicit_target_metrics.exclude_not_applicable,
+        ),
         (
             "Unique_canonical_proteins", 
             unique_proteins
@@ -10885,7 +14150,132 @@ def write_build_summary(state: StateDB, work_root: Path, config: BuildConfig, pl
     )
 
 
-def write_all_final_reports(state: StateDB, work_root: Path, config: BuildConfig, plan: ResourcePlan) -> None:
+REPRODUCTION_TARGET_EVIDENCE_TYPE = "REPRODUCTION_TARGET"
+REPRODUCTION_TARGET_NOTES = (
+    "Automatically generated from final selected assembly."
+)
+
+
+def reproduction_target_rows(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build exact-assembly targets for the completed reference.
+
+    The reproduction target file records the effective final assembly
+    composition, not the rules that originally produced that composition.
+
+    Every selected assembly must still have usable protein data and provenance.
+    Otherwise the completed state is internally inconsistent and must not emit a
+    reproduction recipe that claims the assembly contributed to the reference.
+    """
+
+    selected_rows = conn.execute(
+        """
+        SELECT
+            a.accession,
+            a.species_taxid,
+            a.species,
+            a.strain,
+            a.protein_fasta_available,
+            EXISTS (
+                SELECT 1
+                FROM sources AS src
+                WHERE src.assembly = a.accession
+            ) AS has_sources
+        FROM assemblies AS a
+        WHERE a.selected = 1
+        ORDER BY
+            a.species_taxid,
+            a.accession
+        """
+    ).fetchall()
+
+    rows: list[dict[str, Any]] = []
+
+    for row in selected_rows:
+
+        accession = str(
+            row["accession"]
+        ).strip()
+
+        if not _ASSEMBLY_ACCESSION_VERSION_RE.fullmatch(
+            accession
+        ):
+            raise DataIntegrityError(
+                "Cannot write reproduction target for selected assembly "
+                "without an exact versioned GCF/GCA accession: "
+                f"{accession!r}"
+            )
+
+        if not bool(
+            row["protein_fasta_available"]
+        ):
+            raise DataIntegrityError(
+                "Cannot write reproduction target for selected assembly "
+                "without usable protein data: "
+                f"{accession}"
+            )
+
+        if not bool(
+            row["has_sources"]
+        ):
+            raise DataIntegrityError(
+                "Cannot write reproduction target for selected assembly "
+                "without protein provenance records: "
+                f"{accession}"
+            )
+
+        rows.append(
+            {
+                "Target_type": "assembly",
+                "Species": row["species"],
+                "Taxid": row["species_taxid"],
+                "Strain": row["strain"],
+                "Assembly_accession": accession,
+                "Evidence_type": (
+                    REPRODUCTION_TARGET_EVIDENCE_TYPE
+                ),
+                "Notes": REPRODUCTION_TARGET_NOTES,
+            }
+        )
+
+    return rows
+
+
+def write_reproduction_targets(
+    state: StateDB,
+    work_root: Path,
+) -> int:
+    """Write exact final assembly targets that can reproduce this selection."""
+
+    rows = reproduction_target_rows(
+        state.conn
+    )
+
+    write_tsv(
+        work_root
+        / METADATA_DIR
+        / REPRODUCTION_TARGETS_TSV,
+        EXPLICIT_TARGET_COLUMNS,
+        rows,
+    )
+
+    info(
+        "Reproduction targets written: "
+        f"{len(rows):,} exact selected assembly target(s)."
+    )
+
+    return len(rows)
+
+
+def write_all_final_reports(
+    state: StateDB,
+    work_root: Path,
+    config: BuildConfig,
+    plan: ResourcePlan,
+    *,
+    explicit_targets: Sequence[ResolvedExplicitTarget] = (),
+) -> None:
     write_species_filter_failures_report(state, work_root)
     write_assembly_failure_report(state, work_root)
     write_failed_downloads_report(state, work_root)
@@ -10895,9 +14285,40 @@ def write_all_final_reports(state: StateDB, work_root: Path, config: BuildConfig
         "create-new-updated-version", "overwrite-with-updated-version"
     }:
         write_update_changes_report(state, work_root)
-    write_species_master(state, work_root, config)
-    write_assemblies_master(state, work_root, config)
-    write_build_summary(state, work_root, config, plan)
+    explicit_target_metrics = (
+        write_explicit_targets_report(
+            state,
+            work_root,
+            explicit_targets,
+        )
+    )
+
+    write_reproduction_targets(
+        state,
+        work_root,
+    )
+
+    write_species_master(
+        state,
+        work_root,
+        config,
+    )
+
+    write_assemblies_master(
+        state,
+        work_root,
+        config,
+    )
+
+    write_build_summary(
+        state,
+        work_root,
+        config,
+        plan,
+        explicit_target_metrics=(
+            explicit_target_metrics
+        ),
+    )
 
 
 def print_reference_build_summary(final_root: Path) -> None:
@@ -11673,8 +15094,6 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             f"Source reference: {source_root}"
         )
 
-    print(flush=True)
-
     state_path = work_root / STATE_DB_REL
 
     with StateDB(state_path) as state:
@@ -11783,11 +15202,13 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                 if (
                     config.reset_biological_config
                     and not config.seed_taxa
+                    and not config.include_explicit_targets
                 ):
 
                     raise ConfigError(
                         "--reset-biological-config with a pre-assembly --resume "
-                        "requires --seed-taxa FILE.\n\n"
+                        "requires at least one of --seed-taxa FILE or "
+                        "--include-explicit-targets FILE.\n\n"
                         "The reset returns biological configuration to clean "
                         "defaults, then applies only the biological inputs "
                         "and options supplied in the resume command."
@@ -11891,6 +15312,9 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
         config.ncbi_api_key_detected = bool(os.environ.get("NCBI_API_KEY"))
         config.ncbi_request_rate = NCBI_RPS_WITH_KEY if config.ncbi_api_key_detected else NCBI_RPS_WITHOUT_KEY
 
+        # Separate startup/configuration messages from persistent initialization.
+        print(flush=True)
+
         # On resume, show the initialization section without rewriting SQLite.
         # On a new build, announce_phase() suppresses a duplicate banner.
         state.announce_phase("INITIALIZING")
@@ -11910,11 +15334,37 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
 
         # Config snapshots are selected before saving resolved configuration so
         # every subsequent phase can rely only on immutable copies under config/.
-        seed_path, exclusion_path, filter_path = resolve_config_snapshots(
+        (
+            seed_path,
+            exclusion_path,
+            filter_path,
+            include_explicit_targets_path,
+            exclude_explicit_targets_path,
+        ) = resolve_config_snapshots(
             config,
             work_root,
             source_root,
             state,
+        )
+
+        # Parse and syntactically validate explicit targets before any expensive
+        # taxonomy or assembly-discovery work. NCBI-backed target resolution and
+        # biological selection integration are performed in later phases.
+        include_explicit_targets = parse_explicit_targets(
+            include_explicit_targets_path,
+            action="include",
+            warn_if_empty=config.include_explicit_targets is not None,
+        )
+
+        exclude_explicit_targets = parse_explicit_targets(
+            exclude_explicit_targets_path,
+            action="exclude",
+            warn_if_empty=config.exclude_explicit_targets is not None,
+        )
+
+        detect_explicit_target_conflicts(
+            include_explicit_targets,
+            exclude_explicit_targets,
         )
 
         # At this point both the resolved BuildConfig and the exact immutable TSV
@@ -11924,6 +15374,8 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             seed_snapshot=seed_path,
             exclusion_snapshot=exclusion_path,
             filter_snapshot=filter_path,
+            include_explicit_targets_snapshot=include_explicit_targets_path,
+            exclude_explicit_targets_snapshot=exclude_explicit_targets_path,
         )
 
         save_json_atomic(
@@ -11956,11 +15408,13 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             info(f"Verifying source reference manifest before reuse: {source_root}")
             verify_completed_reference(source_root)
 
-        # Separate initialization from taxonomy after all initialization
-        # messages and source-reference checks have finished.
-        print(flush=True)
-
         client = NCBIClient(config.ncbi_request_rate, work_root / LOGS_DIR)
+
+        resolved_explicit_targets_path = (
+            work_root
+            / CONFIG_DIR
+            / RESOLVED_EXPLICIT_TARGETS_JSON
+        )
 
         # ------------------------------------------------------------------
         # 1. Curated taxonomy and species-level filtering
@@ -11973,6 +15427,15 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
         )
 
         excluded_rows: list[dict[str, Any]] = []
+
+        resolved_include_targets_for_inventory: Sequence[
+            ResolvedExplicitTarget
+        ] = ()
+
+        resolved_exclude_targets_for_selection: Sequence[
+            ResolvedExplicitTarget
+        ] = ()
+
         if need_curation:
 
             if config.run_mode == "resume":
@@ -12002,17 +15465,110 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
 
                 state.clear_preassembly_data()
 
+            # Separate initialization from taxonomy after any resume-specific
+            # initialization messages have been printed.
+            print(flush=True)
+
             # Enter taxonomy curation before printing its introductory message.
             state.set_global_state("TAXONOMY_CURATION")
 
+            target_only_curation = (
+                config.seed_taxa is None
+                and bool(include_explicit_targets)
+            )
+
+            curation_inputs: list[str] = []
+
+            if config.seed_taxa is not None:
+                curation_inputs.append("seed taxa")
+
+            if config.exclude_taxa is not None:
+                curation_inputs.append("excluded taxa")
+
+            if include_explicit_targets:
+                curation_inputs.append(
+                    "explicit inclusion targets"
+                )
+
+            if exclude_explicit_targets:
+                curation_inputs.append(
+                    "explicit exclusion targets"
+                )
+
+            if config.metadata_filters is not None:
+                curation_inputs.append(
+                    "metadata filters"
+                )
+
+            if len(curation_inputs) == 1:
+                curation_input_text = curation_inputs[0]
+            elif len(curation_inputs) == 2:
+                curation_input_text = (
+                    f"{curation_inputs[0]} and "
+                    f"{curation_inputs[1]}"
+                )
+            else:
+                curation_input_text = (
+                    ", ".join(curation_inputs[:-1])
+                    + f" and {curation_inputs[-1]}"
+                )
+
             info(
-                "Building the curated fungal species set from seed taxa, "
-                "taxonomic exclusions and species-level filters."
+                "Building the curated fungal species set using "
+                f"{curation_input_text}."
+            )
+
+            all_resolved_explicit_targets = resolve_explicit_targets(
+                client,
+                [
+                    *include_explicit_targets,
+                    *exclude_explicit_targets,
+                ],
+            )
+
+            include_target_count = len(
+                include_explicit_targets
+            )
+
+            resolved_include_explicit_targets = (
+                all_resolved_explicit_targets[
+                    :include_target_count
+                ]
+            )
+
+            resolved_exclude_explicit_targets = (
+                all_resolved_explicit_targets[
+                    include_target_count:
+                ]
+            )
+
+            detect_resolved_explicit_target_conflicts(
+                resolved_include_explicit_targets,
+                resolved_exclude_explicit_targets,
+            )
+
+            report_resolved_explicit_targets(
+                resolved_include_explicit_targets,
+                resolved_exclude_explicit_targets,
+            )
+
+            save_resolved_explicit_targets(
+                resolved_explicit_targets_path,
+                all_resolved_explicit_targets,
+            )
+
+            resolved_include_targets_for_inventory = (
+                resolved_include_explicit_targets
+            )
+
+            resolved_exclude_targets_for_selection = (
+                resolved_exclude_explicit_targets
             )
 
             seed_rules = parse_seed_rules(
                 seed_path,
                 client,
+                allow_no_data_rows=target_only_curation,
             )
 
             exclusion_rules = parse_exclusion_rules(
@@ -12030,7 +15586,10 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             write_resolved_filters(work_root / METADATA_DIR / "metadata_filters_resolved.tsv", all_rules)
             try:
                 included, excluded_rows, _, all_candidates, seed_counts, exclusion_counts = build_curated_species(
-                    client, seed_rules, exclusion_rules
+                    client,
+                    seed_rules,
+                    exclusion_rules,
+                    resolved_include_explicit_targets,
                 )
             except CurationConflict as conflict:
                 pause_for_curation_fix(state, work_root, conflict)
@@ -12045,7 +15604,16 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             )
             write_excluded_taxa_report(work_root, excluded_rows)
             insert_species_rows(state, all_candidates)
-            species_map = apply_species_filters(state, included, all_rules)
+            species_map = apply_species_filters(
+                state,
+                included,
+                all_rules,
+                required_taxids={
+                    target.species_taxid
+                    for target
+                    in resolved_include_explicit_targets
+                },
+            )
             state.set_global_state("TAXONOMY_CURATION_COMPLETE")
 
             # Frame the taxonomy summary as a note within this work phase.
@@ -12059,6 +15627,50 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             print_section_separator()
             print(flush=True)
         else:
+            all_resolved_explicit_targets = (
+                load_resolved_explicit_targets(
+                    resolved_explicit_targets_path,
+                    [
+                        *include_explicit_targets,
+                        *exclude_explicit_targets,
+                    ],
+                )
+            )
+
+            include_target_count = len(
+                include_explicit_targets
+            )
+
+            resolved_include_explicit_targets = (
+                all_resolved_explicit_targets[
+                    :include_target_count
+                ]
+            )
+
+            resolved_exclude_explicit_targets = (
+                all_resolved_explicit_targets[
+                    include_target_count:
+                ]
+            )
+
+            detect_resolved_explicit_target_conflicts(
+                resolved_include_explicit_targets,
+                resolved_exclude_explicit_targets,
+            )
+
+            report_resolved_explicit_targets(
+                resolved_include_explicit_targets,
+                resolved_exclude_explicit_targets,
+            )
+
+            resolved_include_targets_for_inventory = (
+                resolved_include_explicit_targets
+            )
+
+            resolved_exclude_targets_for_selection = (
+                resolved_exclude_explicit_targets
+            )
+
             metadata_rules = parse_metadata_filters(
                 filter_path,
                 warn_if_empty=config.metadata_filters is not None,
@@ -12066,6 +15678,9 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             all_rules = cli_filter_rules(config) + metadata_rules
             detect_obvious_filter_contradictions(all_rules)
             species_map = load_species_map_from_state(state, only_filter_pass=True)
+
+            # Separate initialization from the reused taxonomy phase.
+            print(flush=True)
 
             # Announce the reused stage without modifying its checkpoint.
             state.announce_phase("TAXONOMY_CURATION")
@@ -12120,6 +15735,7 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                 species_map,
                 config,
                 all_rules,
+                resolved_include_targets_for_inventory,
             )
 
             state.set_global_state(
@@ -12155,6 +15771,14 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
         print_section_separator()
 
         print(flush=True)
+
+        selection_constraints_by_species = (
+            build_assembly_selection_constraints_by_species(
+                species_map,
+                resolved_include_targets_for_inventory,
+                resolved_exclude_targets_for_selection,
+            )
+        )
 
         # ------------------------------------------------------------------
         # 3. Resource planning before protein downloads and merging
@@ -12389,6 +16013,9 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                     reusable,
                     old,
                     config,
+                    selection_constraints_by_species=(
+                        selection_constraints_by_species
+                    ),
                 )
 
                 info(
@@ -12410,6 +16037,9 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                     config,
                     work_root,
                     plan,
+                    selection_constraints_by_species=(
+                        selection_constraints_by_species
+                    ),
                     update_mode=False,
                 )
 
@@ -12584,6 +16214,9 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                 work_root,
                 config,
                 plan,
+                explicit_targets=(
+                    all_resolved_explicit_targets
+                ),
             )
 
             state.set_global_state(
@@ -12736,6 +16369,11 @@ def main(
         info(
             f"  Protein provenance: "
             f"{final_root / METADATA_DIR / 'fungal_protein_sources.tsv'}"
+        )
+
+        info(
+            f"  Reproduction targets: "
+            f"{final_root / METADATA_DIR / REPRODUCTION_TARGETS_TSV}"
         )
 
         info(
