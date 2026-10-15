@@ -46,7 +46,7 @@ except ImportError:
 ########################################################################################################
 
 TOOL_NAME = "FungiFunk_refdb"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 FINAL_FASTA_NAME = "FungiFunk_protein_refdb.faa"
 
 ESTIMATED_RAM_GIB_PER_WORKER = 1.0
@@ -11637,8 +11637,31 @@ def run_species_workers(
                     for other in future_map:
                         other.cancel()
                     raise DataIntegrityError(f"Species worker failed for {job.species.species}: {exc}") from exc
-                import_species_worker_result(state, result, {a.accession: a for a in job.assemblies})
+                import_species_worker_result(
+                    state,
+                    result,
+                    {
+                        assembly.accession: assembly
+                        for assembly in job.assemblies
+                    },
+                )
+
+                selected_accessions = tuple(
+                    str(row["accession"])
+                    for row in state.conn.execute(
+                        """
+                        SELECT accession
+                        FROM assemblies
+                        WHERE species_taxid=?
+                          AND selected=1
+                        ORDER BY accession
+                        """,
+                        (result.species_taxid,),
+                    )
+                )
+
                 completed_species += 1
+
                 if config.verbose:
                     if result.successful_assemblies > 0:
                         worker_finished_block(
@@ -11699,7 +11722,9 @@ def run_species_workers(
                             f"       Assemblies attempted={result.attempted_assemblies} | "
                             f"Accepted={result.successful_assemblies} | "
                             f"Proteins={result.total_source_occurrences:,} | "
-                            f"Unique={result.unique_sequences:,}"
+                            f"Unique={result.unique_sequences:,}\n"
+                            f"       Assemblies included ({len(selected_accessions)}): "
+                            f"{', '.join(selected_accessions)}"
                         )
 
                     else:
@@ -12027,6 +12052,15 @@ def finalize_update_selection(
                 f"Reused={selected_reused} | "
                 f"Processed={selected_processed}"
             )
+
+            if selected:
+                lines.append(
+                    "       "
+                    f"Assemblies included ({len(selected)}): "
+                    + ", ".join(
+                        sorted(selected)
+                    )
+                )
 
             info(
                 "\n".join(lines)
@@ -15243,6 +15277,10 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
 
         else:
 
+            # Separate startup/configuration from initialization before the
+            # new-build state transition announces the INITIALIZING banner.
+            print(flush=True)
+
             state.set_meta("build_origin_mode", config.run_mode)
             state.set_global_state("INITIALIZING")
 
@@ -15312,8 +15350,10 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
         config.ncbi_api_key_detected = bool(os.environ.get("NCBI_API_KEY"))
         config.ncbi_request_rate = NCBI_RPS_WITH_KEY if config.ncbi_api_key_detected else NCBI_RPS_WITHOUT_KEY
 
-        # Separate startup/configuration messages from persistent initialization.
-        print(flush=True)
+        # Resume does not enter INITIALIZING through set_global_state(), so add
+        # the visual separation immediately before announcing the reused phase.
+        if config.run_mode == "resume":
+            print(flush=True)
 
         # On resume, show the initialization section without rewriting SQLite.
         # On a new build, announce_phase() suppresses a duplicate banner.
