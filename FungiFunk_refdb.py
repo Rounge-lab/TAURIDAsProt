@@ -24,7 +24,7 @@ import time
 import traceback
 import zipfile
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,7 +46,7 @@ except ImportError:
 ########################################################################################################
 
 TOOL_NAME = "FungiFunk_refdb"
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 FINAL_FASTA_NAME = "FungiFunk_protein_refdb.faa"
 
 ESTIMATED_RAM_GIB_PER_WORKER = 1.0
@@ -9249,6 +9249,80 @@ CREATE TABLE assembly_results (
 """
 
 
+def retryable_ncbi_failed_accessions(
+    conn: sqlite3.Connection,
+) -> tuple[str, ...]:
+    """Return assemblies that ended in a classified NCBI retrieval failure."""
+
+    reasons = tuple(
+        sorted(NCBI_RETRIEVAL_FAILURE_REASONS)
+    )
+
+    placeholders = ",".join(
+        "?"
+        for _ in reasons
+    )
+
+    return tuple(
+        str(row[0])
+        for row in conn.execute(
+            f"""
+            SELECT accession
+            FROM assembly_results
+            WHERE status='FAILED'
+              AND reason IN ({placeholders})
+            ORDER BY accession
+            """,
+            reasons,
+        )
+    )
+
+
+def retryable_ncbi_failed_accessions_from_state(
+    state: StateDB,
+    species_taxid: int,
+    allowed_accessions: Sequence[str],
+) -> tuple[str, ...]:
+    """Return unresolved retryable NCBI failures from persistent state."""
+
+    allowed = set(
+        allowed_accessions
+    )
+
+    if not allowed:
+        return ()
+
+    reasons = tuple(
+        sorted(
+            NCBI_RETRIEVAL_FAILURE_REASONS
+        )
+    )
+
+    placeholders = ",".join(
+        "?"
+        for _ in reasons
+    )
+
+    return tuple(
+        sorted(
+            str(row["assembly"])
+            for row in state.conn.execute(
+                f"""
+                SELECT DISTINCT assembly
+                FROM failed_downloads
+                WHERE species_taxid=?
+                  AND reason IN ({placeholders})
+                """,
+                (
+                    species_taxid,
+                    *reasons,
+                ),
+            )
+            if str(row["assembly"]) in allowed
+        )
+    )
+
+
 @dataclass
 class FastaRecord:
     header: str
@@ -9442,6 +9516,8 @@ class WorkerResult:
     attempted_assemblies: int
     failure_reasons: dict[str, int]
 
+    retryable_ncbi_failures: tuple[str, ...] = ()
+
     eligible_strain_groups: int | None = None
     represented_strain_groups: int | None = None
 
@@ -9452,6 +9528,150 @@ class WorkerResult:
     represented_unassigned_groups: int | None = None
 
     species_fallback_used: bool = False
+
+
+@dataclass
+class NCBIRecoverySummary:
+    """Track one species through automatic restorative NCBI recovery."""
+
+    species_taxid: int
+    species: str
+    retried_accessions: tuple[str, ...]
+    recovered_accessions: tuple[str, ...]
+    selected_before_recovery: tuple[str, ...]
+
+
+def resolve_known_available_selection(
+    state: StateDB,
+    species_taxid: int,
+    config: BuildConfig,
+    constraints: AssemblySelectionConstraints,
+) -> tuple[str, ...]:
+    """Resolve biological selection from protein availability already in state."""
+
+    current_pool = load_assembly_pool_from_state(
+        state,
+        [species_taxid],
+    ).get(
+        species_taxid,
+        [],
+    )
+
+    usable_accessions: set[str] = set()
+
+    for assembly in current_pool:
+        row = state.conn.execute(
+            """
+            SELECT protein_fasta_available
+            FROM assemblies
+            WHERE accession=?
+            """,
+            (assembly.accession,),
+        ).fetchone()
+
+        if (
+            row is not None
+            and bool(
+                row["protein_fasta_available"]
+            )
+        ):
+            usable_accessions.add(
+                assembly.accession
+            )
+
+    resolution = execute_assembly_selection(
+        current_pool,
+        assembly_selection_policy(config),
+        lambda assembly: (
+            assembly.accession
+            in usable_accessions
+        ),
+        constraints=constraints,
+    )
+
+    return tuple(
+        sorted(
+            resolution.selected_accessions
+        )
+    )
+
+
+def build_ncbi_recovery_job(
+    job: WorkerJob,
+    retry_accessions: Sequence[str],
+) -> WorkerJob:
+    """Build an isolated worker job for one automatic NCBI recovery pass."""
+
+    requested = set(
+        retry_accessions
+    )
+
+    if not requested:
+        raise DataIntegrityError(
+            "Cannot build an NCBI recovery job without assembly accessions."
+        )
+
+    available = {
+        assembly.accession
+        for assembly in job.assemblies
+    }
+
+    unknown = sorted(
+        requested - available
+    )
+
+    if unknown:
+        raise DataIntegrityError(
+            "NCBI recovery requested assemblies outside the original "
+            "species worker job: "
+            + ", ".join(unknown)
+        )
+
+    recovery_assemblies = [
+        assembly
+        for assembly in job.assemblies
+        if assembly.accession in requested
+    ]
+
+    recovery_temp_base = (
+        Path(job.temp_base)
+        / "ncbi_recovery"
+    )
+
+    recovery_ready_dir = (
+        Path(job.ready_dir).parent
+        / "ncbi_recovery_prepared_species"
+    )
+
+    recovery_temp_base.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    recovery_ready_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    return dataclasses.replace(
+        job,
+        assemblies=recovery_assemblies,
+
+        # Recovery resolves protein availability only. Biological selection is
+        # rerun later against the complete species pool.
+        selection_policy=None,
+        selection_constraints=None,
+
+        # Keep partial recovery products separate from the normal species-ready
+        # checkpoint so they can never overwrite the first-pass result.
+        temp_base=str(recovery_temp_base),
+        ready_dir=str(recovery_ready_dir),
+
+        # Recovery worker numbering is assigned independently when the recovery
+        # queue is executed.
+        worker_id=0,
+        worker_total=0,
+    )
 
 
 def validate_species_products(fasta_path: Path, sqlite_path: Path, expected_assemblies: Sequence[str]) -> tuple[int, int]:
@@ -10304,6 +10524,12 @@ def process_species_worker(job: WorkerJob) -> WorkerResult:
 
                 conn.commit()
 
+            retryable_ncbi_failures = (
+                retryable_ncbi_failed_accessions(
+                    conn
+                )
+            )
+
             fsync_file(seq_store)
             fsync_file(fasta_out)
 
@@ -10351,6 +10577,9 @@ def process_species_worker(job: WorkerJob) -> WorkerResult:
             total_source_occurrences=source_count,
             attempted_assemblies=attempted,
             failure_reasons=failure_reasons,
+            retryable_ncbi_failures=(
+                retryable_ncbi_failures
+            ),
 
             species_fallback_used=(
                 resolution.species_fallback_used
@@ -10404,7 +10633,13 @@ def process_species_worker(job: WorkerJob) -> WorkerResult:
         )
 
 
-def import_species_worker_result(state: StateDB, result: WorkerResult, assembly_map: Mapping[str, AssemblyRecord]) -> None:
+def import_species_worker_result(
+    state: StateDB,
+    result: WorkerResult,
+    assembly_map: Mapping[str, AssemblyRecord],
+    *,
+    replace_species_data: bool = True,
+) -> None:
     fasta_path = Path(result.fasta_ready)
     local_db_path = Path(result.sources_ready)
     validate_species_products(fasta_path, local_db_path, [a.accession for a in assembly_map.values()])
@@ -10412,11 +10647,60 @@ def import_species_worker_result(state: StateDB, result: WorkerResult, assembly_
     local.row_factory = sqlite3.Row
     try:
         with state.conn:
-            # Make resume safe to repeat: before re-importing a species result,
-            # remove its previous sources and warnings so they are not duplicated.
-            state.conn.execute("DELETE FROM sources WHERE species_taxid=?", (result.species_taxid,))
-            state.conn.execute("DELETE FROM protein_warnings WHERE species_taxid=?", (result.species_taxid,))
-            state.conn.execute("DELETE FROM failed_downloads WHERE species_taxid=?", (result.species_taxid,))
+            if replace_species_data:
+                # Full species import: replace the complete previously imported
+                # worker result so resume/re-import remains idempotent.
+                state.conn.execute(
+                    "DELETE FROM sources WHERE species_taxid=?",
+                    (result.species_taxid,),
+                )
+                state.conn.execute(
+                    "DELETE FROM protein_warnings WHERE species_taxid=?",
+                    (result.species_taxid,),
+                )
+                state.conn.execute(
+                    "DELETE FROM failed_downloads WHERE species_taxid=?",
+                    (result.species_taxid,),
+                )
+
+            else:
+                # Partial recovery import: replace data only for the assemblies
+                # being retried. Successful first-pass assemblies for the same
+                # species must remain untouched.
+                for accession in sorted(assembly_map):
+                    state.conn.execute(
+                        """
+                        DELETE FROM sources
+                        WHERE species_taxid=?
+                          AND assembly=?
+                        """,
+                        (
+                            result.species_taxid,
+                            accession,
+                        ),
+                    )
+                    state.conn.execute(
+                        """
+                        DELETE FROM protein_warnings
+                        WHERE species_taxid=?
+                          AND assembly=?
+                        """,
+                        (
+                            result.species_taxid,
+                            accession,
+                        ),
+                    )
+                    state.conn.execute(
+                        """
+                        DELETE FROM failed_downloads
+                        WHERE species_taxid=?
+                          AND assembly=?
+                        """,
+                        (
+                            result.species_taxid,
+                            accession,
+                        ),
+                    )
 
             for row in local.execute("SELECT * FROM sources"):
                 source_id = f"FFSRC_{row['sequence_sha256']}"
@@ -10492,6 +10776,181 @@ def recover_ready_species(state: StateDB, species: SpeciesCandidate, assemblies:
         fasta_ready.unlink(missing_ok=True)
         sources_ready.unlink(missing_ok=True)
         return False
+
+
+def recover_ncbi_recovery_ready_species(
+    state: StateDB,
+    species: SpeciesCandidate,
+    assemblies: Sequence[AssemblyRecord],
+    ready_dir: Path,
+) -> tuple[str, ...] | None:
+    """Import a committed automatic NCBI recovery product after interruption."""
+
+    fasta_ready = (
+        ready_dir
+        / f"Species_{species.taxid}.faa.ready"
+    )
+
+    sources_ready = (
+        ready_dir
+        / f"Species_{species.taxid}.sources.sqlite.ready"
+    )
+
+    fasta_exists = fasta_ready.is_file()
+    sources_exists = sources_ready.is_file()
+
+    if not fasta_exists and not sources_exists:
+        return None
+
+    if not (
+        fasta_exists
+        and sources_exists
+    ):
+        warn(
+            "Discarding incomplete automatic NCBI recovery checkpoint for "
+            f"{species.species}; recovery will be attempted again."
+        )
+
+        fasta_ready.unlink(
+            missing_ok=True
+        )
+
+        sources_ready.unlink(
+            missing_ok=True
+        )
+
+        return None
+
+    local: sqlite3.Connection | None = None
+
+    try:
+        local = sqlite3.connect(
+            sources_ready
+        )
+
+        local.row_factory = sqlite3.Row
+
+        result_rows = list(
+            local.execute(
+                """
+                SELECT *
+                FROM assembly_results
+                ORDER BY accession
+                """
+            )
+        )
+
+        recovery_accessions = tuple(
+            str(row["accession"])
+            for row in result_rows
+        )
+
+        if not recovery_accessions:
+            raise DataIntegrityError(
+                "Automatic NCBI recovery checkpoint contains no "
+                "assembly result rows."
+            )
+
+        assembly_map = {
+            assembly.accession: assembly
+            for assembly in assemblies
+        }
+
+        unknown = sorted(
+            set(recovery_accessions)
+            - set(assembly_map)
+        )
+
+        if unknown:
+            raise DataIntegrityError(
+                "Automatic NCBI recovery checkpoint contains assemblies "
+                "outside the current species candidate pool: "
+                + ", ".join(unknown)
+            )
+
+        unique_count, source_count = (
+            validate_species_products(
+                fasta_ready,
+                sources_ready,
+                recovery_accessions,
+            )
+        )
+
+        successful = sum(
+            1
+            for row in result_rows
+            if row["status"] == "COMMITTED"
+        )
+
+        failure_reasons = dict(
+            Counter(
+                str(row["reason"])
+                for row in result_rows
+                if row["status"] == "FAILED"
+            )
+        )
+
+        result = WorkerResult(
+            species_taxid=species.taxid,
+            species=species.species,
+            fasta_ready=str(
+                fasta_ready
+            ),
+            sources_ready=str(
+                sources_ready
+            ),
+            successful_assemblies=successful,
+            unique_sequences=unique_count,
+            total_source_occurrences=source_count,
+            attempted_assemblies=len(
+                recovery_accessions
+            ),
+            failure_reasons=failure_reasons,
+        )
+
+        import_species_worker_result(
+            state,
+            result,
+            {
+                accession: assembly_map[
+                    accession
+                ]
+                for accession
+                in recovery_accessions
+            },
+            replace_species_data=False,
+        )
+
+        info(
+            "Recovered validated automatic NCBI recovery checkpoint from "
+            f"previous interrupted run: {species.species}"
+        )
+
+        return recovery_accessions
+
+    except (
+        FungiFunkError,
+        sqlite3.Error,
+        OSError,
+    ) as exc:
+        warn(
+            "Discarding invalid automatic NCBI recovery checkpoint for "
+            f"{species.species}: {exc}"
+        )
+
+        fasta_ready.unlink(
+            missing_ok=True
+        )
+
+        sources_ready.unlink(
+            missing_ok=True
+        )
+
+        return None
+
+    finally:
+        if local is not None:
+            local.close()
 
 
 def worker_prefix(job: WorkerJob) -> str:
@@ -11460,7 +11919,7 @@ def run_species_workers(
         AssemblySelectionConstraints,
     ] | None = None,
     update_mode: bool = False,
-) -> None:
+) -> dict[int, NCBIRecoverySummary]:
     ready_dir = work_root / TMP_DIR / "prepared_species"
     ready_dir.mkdir(parents=True, exist_ok=True)
     temp_base = Path(config.tmpdir) if config.tmpdir else work_root / TMP_DIR / "workers"
@@ -11511,6 +11970,24 @@ def run_species_workers(
 
     jobs: list[WorkerJob] = []
 
+    recovery_jobs: list[WorkerJob] = []
+
+    recovery_summaries: dict[
+        int,
+        NCBIRecoverySummary,
+    ] = {}
+
+    recovery_ready_dir = (
+        work_root
+        / TMP_DIR
+        / "ncbi_recovery_prepared_species"
+    )
+
+    recovery_ready_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     # Fresh builds can apply the complete biological selection policy while
     # candidates are processed, avoiding unnecessary downloads once a selection
     # role has been filled.
@@ -11530,59 +12007,155 @@ def run_species_workers(
         else {}
     )
 
-    for taxid, species in sorted(species_map.items(), key=lambda kv: (kv[1].species, kv[0])):
-        assemblies = pools.get(taxid, [])
-        if not assemblies:
-            continue
-        db_row = state.conn.execute("SELECT state FROM species WHERE taxid=?", (taxid,)).fetchone()
-        if db_row and db_row["state"] == "PREPARED":
-            continue
-        if recover_ready_species(state, species, assemblies, ready_dir):
-            continue
-        with state.conn:
-            state.conn.execute("UPDATE species SET state='PROCESSING' WHERE taxid=?", (taxid,))
-        jobs.append(
-            WorkerJob(
-                species=species,
-                assemblies=assemblies,
-
-                # Fresh builds select dynamically while protein usability becomes known.
-                #
-                # Update workers receive selection_policy=None because every new/changed
-                # candidate in the delta must first have its protein availability resolved.
-                # The final update selection is performed later against the combined pool of
-                # reusable + newly processed candidates.
-                selection_policy=worker_selection_policy,
-
-                selection_constraints=(
-                    None
-                    if update_mode
-                    else worker_selection_constraints.get(
-                        taxid,
-                        AssemblySelectionConstraints(),
-                    )
-                ),
-
-                temp_base=str(temp_base),
-                ready_dir=str(ready_dir),
-
-                # Shared protection controlling NCBI command start frequency.
-                shared_limiter=limiter,
-
-                # Shared protection controlling simultaneous NCBI commands.
-                shared_ncbi_concurrency=ncbi_concurrency,
-
-                output_root=str(work_root),
-                console_lock=console_lock,
-                verbose=config.verbose,
-                timestamps=config.timestamps,
-            )
+    for taxid, species in sorted(
+        species_map.items(),
+        key=lambda kv: (
+            kv[1].species,
+            kv[0],
+        ),
+    ):
+        assemblies = pools.get(
+            taxid,
+            [],
         )
 
-    if not jobs:
-        # An update may have no new candidates, or its pending species may
-        # already be prepared or have been recovered from validated results.
-        # Explain the empty queue instead of returning silently.
+        if not assemblies:
+            continue
+
+        job = WorkerJob(
+            species=species,
+            assemblies=assemblies,
+
+            # Fresh builds select dynamically while protein usability becomes
+            # known. Update workers resolve availability for the complete delta
+            # and defer biological selection until reusable and processed
+            # candidates can be evaluated together.
+            selection_policy=(
+                worker_selection_policy
+            ),
+
+            selection_constraints=(
+                None
+                if update_mode
+                else worker_selection_constraints.get(
+                    taxid,
+                    AssemblySelectionConstraints(),
+                )
+            ),
+
+            temp_base=str(
+                temp_base
+            ),
+
+            ready_dir=str(
+                ready_dir
+            ),
+
+            shared_limiter=limiter,
+
+            shared_ncbi_concurrency=(
+                ncbi_concurrency
+            ),
+
+            output_root=str(
+                work_root
+            ),
+
+            console_lock=console_lock,
+            verbose=config.verbose,
+            timestamps=config.timestamps,
+        )
+
+        db_row = state.conn.execute(
+            """
+            SELECT state
+            FROM species
+            WHERE taxid=?
+            """,
+            (taxid,),
+        ).fetchone()
+
+        species_prepared = bool(
+            db_row is not None
+            and db_row["state"] == "PREPARED"
+        )
+
+        # A worker may have committed its normal .ready files immediately
+        # before the coordinator was interrupted. Recover that complete
+        # first-pass result before deciding whether NCBI recovery is pending.
+        if not species_prepared:
+
+            if recover_ready_species(
+                state,
+                species,
+                assemblies,
+                ready_dir,
+            ):
+                species_prepared = True
+
+        if species_prepared:
+
+            # A recovery worker may itself have completed immediately before
+            # coordinator interruption. Its separate .ready product is the
+            # durable evidence that the one automatic recovery pass finished.
+            #
+            # Import it idempotently and never issue another automatic NCBI
+            # retry for those assemblies.
+            recovered_checkpoint = (
+                recover_ncbi_recovery_ready_species(
+                    state,
+                    species,
+                    assemblies,
+                    recovery_ready_dir,
+                )
+            )
+
+            if recovered_checkpoint is not None:
+                continue
+
+            # No completed recovery checkpoint exists. Reconstruct a pending
+            # automatic recovery queue from the persistent first-pass failures.
+            retry_accessions = (
+                retryable_ncbi_failed_accessions_from_state(
+                    state,
+                    taxid,
+                    [
+                        assembly.accession
+                        for assembly in assemblies
+                    ],
+                )
+            )
+
+            if retry_accessions:
+                recovery_jobs.append(
+                    build_ncbi_recovery_job(
+                        job,
+                        retry_accessions,
+                    )
+                )
+
+            continue
+
+        with state.conn:
+            state.conn.execute(
+                """
+                UPDATE species
+                SET state='PROCESSING'
+                WHERE taxid=?
+                """,
+                (taxid,),
+            )
+
+        jobs.append(
+            job
+        )
+
+    if (
+        not jobs
+        and not recovery_jobs
+    ):
+        # An update may have no new candidates, or all species may already have
+        # committed processing/recovery checkpoints.
         if update_mode:
             info(
                 "Species processing: 0 species queued; no protein worker "
@@ -11590,7 +12163,8 @@ def run_species_workers(
             )
 
         manager.shutdown()
-        return
+
+        return {}
     
     worker_total = len(jobs)
 
@@ -11610,16 +12184,23 @@ def run_species_workers(
         ncbi_concurrency_limit,
     )
 
-    info(
-        f"Species processing: {len(jobs)} species queued; "
-        f"up to {effective_concurrency} local workers will run concurrently."
-    )
+    if jobs:
+        info(
+            f"Species processing: {len(jobs)} species queued; "
+            f"up to {effective_concurrency} local workers will run concurrently."
+        )
 
-    info(
-        f"NCBI access: up to {effective_ncbi_concurrency} concurrent "
-        f"Datasets commands; request-start limit "
-        f"{config.ncbi_request_rate:g}/s."
-    )
+        info(
+            f"NCBI access: up to {effective_ncbi_concurrency} concurrent "
+            f"Datasets commands; request-start limit "
+            f"{config.ncbi_request_rate:g}/s."
+        )
+
+    else:
+        info(
+            "Species processing: 0 first-pass species jobs remain; "
+            "resuming pending automatic NCBI recovery."
+        )
 
     try:
         with ProcessPoolExecutor(max_workers=resource_plan.used_workers) as executor:
@@ -11645,6 +12226,14 @@ def run_species_workers(
                         for assembly in job.assemblies
                     },
                 )
+
+                if result.retryable_ncbi_failures:
+                    recovery_jobs.append(
+                        build_ncbi_recovery_job(
+                            job,
+                            result.retryable_ncbi_failures,
+                        )
+                    )
 
                 selected_accessions = tuple(
                     str(row["accession"])
@@ -11712,7 +12301,19 @@ def run_species_workers(
                     )
 
                     if result.successful_assemblies > 0:
-                        status = "INCLUDED"
+                        status = "PROCESSED" if update_mode else "INCLUDED"
+
+                        success_label = (
+                            "With usable proteins"
+                            if update_mode
+                            else "Accepted"
+                        )
+
+                        assemblies_label = (
+                            "Assemblies with usable proteins"
+                            if update_mode
+                            else "Assemblies included"
+                        )
 
                         info(
                             f"Species {completed_species:>{progress_width}}/{worker_total} "
@@ -11720,15 +12321,21 @@ def run_species_workers(
                             f"{result.species}"
                             f"{representation_line}\n"
                             f"       Assemblies attempted={result.attempted_assemblies} | "
-                            f"Accepted={result.successful_assemblies} | "
+                            f"{success_label}={result.successful_assemblies} | "
                             f"Proteins={result.total_source_occurrences:,} | "
                             f"Unique={result.unique_sequences:,}\n"
-                            f"       Assemblies included ({len(selected_accessions)}): "
+                            f"       {assemblies_label} ({len(selected_accessions)}): "
                             f"{', '.join(selected_accessions)}"
                         )
 
                     else:
-                        status = "NOT INCLUDED"
+                        status = "PROCESSED" if update_mode else "NOT INCLUDED"
+
+                        success_label = (
+                            "With usable proteins"
+                            if update_mode
+                            else "Accepted"
+                        )
 
                         failure_summary = " | ".join(
                             f"{reason}={count}"
@@ -11741,7 +12348,7 @@ def run_species_workers(
                             f"{result.species}"
                             f"{representation_line}\n"
                             f"       Assemblies attempted={result.attempted_assemblies} | "
-                            f"Accepted=0 | "
+                            f"{success_label}=0 | "
                             f"Proteins=0 | "
                             f"Unique=0"
                         )
@@ -11751,35 +12358,579 @@ def run_species_workers(
 
                         info(message)
 
-                # If every attempted assembly for a non-included species failed
-                # specifically because NCBI retrieval could not be completed,
-                # make that distinction visible immediately to the user.
-                #
-                # Requiring all attempted assemblies to have an NCBI retrieval
-                # reason lets this concise warning state the cause confidently.
-                if (
-                    result.successful_assemblies == 0
-                    and result.attempted_assemblies > 0
+        if recovery_jobs:
+            recovery_assembly_total = sum(
+                len(job.assemblies)
+                for job in recovery_jobs
+            )
+
+            recovery_species_total = len(
+                recovery_jobs
+            )
+
+            print(flush=True)
+
+            info(
+                "Starting automatic restorative recovery for assemblies "
+                "affected by NCBI retrieval failures."
+            )
+
+            info(
+                f"Recovery queue: {recovery_assembly_total:,} assemblies "
+                f"across {recovery_species_total:,} species."
+            )
+
+            for recovery_job in recovery_jobs:
+
+                species_taxid = (
+                    recovery_job.species.taxid
+                )
+
+                constraints = (
+                    selection_constraints_by_species.get(
+                        species_taxid,
+                        AssemblySelectionConstraints(),
+                    )
+                    if selection_constraints_by_species is not None
+                    else AssemblySelectionConstraints()
+                )
+
+                recovery_summaries[
+                    species_taxid
+                ] = NCBIRecoverySummary(
+                    species_taxid=species_taxid,
+                    species=(
+                        recovery_job.species.species
+                    ),
+                    retried_accessions=tuple(
+                        sorted(
+                            assembly.accession
+                            for assembly
+                            in recovery_job.assemblies
+                        )
+                    ),
+                    recovered_accessions=(),
+                    selected_before_recovery=(
+                        resolve_known_available_selection(
+                            state,
+                            species_taxid,
+                            config,
+                            constraints,
+                        )
+                    ),
+                )
+
+            for recovery_worker_id, recovery_job in enumerate(
+                recovery_jobs,
+                start=1,
+            ):
+                recovery_job.worker_id = recovery_worker_id
+                recovery_job.worker_total = recovery_species_total
+
+            recovered_assemblies = 0
+            still_failed_assemblies = 0
+
+            with ProcessPoolExecutor(
+                max_workers=resource_plan.used_workers
+            ) as executor:
+
+                recovery_future_map = {
+                    executor.submit(
+                        process_species_worker,
+                        recovery_job,
+                    ): recovery_job
+                    for recovery_job in recovery_jobs
+                }
+
+                for future in as_completed(
+                    recovery_future_map
                 ):
-                    ncbi_failed_attempts = sum(
-                        count
-                        for reason, count in result.failure_reasons.items()
-                        if reason in NCBI_RETRIEVAL_FAILURE_REASONS
+                    recovery_job = recovery_future_map[
+                        future
+                    ]
+
+                    try:
+                        recovery_result = future.result()
+
+                    except FungiFunkError:
+                        for other in recovery_future_map:
+                            other.cancel()
+                        raise
+
+                    except Exception as exc:
+                        for other in recovery_future_map:
+                            other.cancel()
+
+                        raise DataIntegrityError(
+                            "NCBI recovery worker failed for "
+                            f"{recovery_job.species.species}: {exc}"
+                        ) from exc
+
+                    import_species_worker_result(
+                        state,
+                        recovery_result,
+                        {
+                            assembly.accession: assembly
+                            for assembly
+                            in recovery_job.assemblies
+                        },
+                        replace_species_data=False,
                     )
 
-                    if (
-                        ncbi_failed_attempts
-                        == result.attempted_assemblies
-                    ):
-                        warn(
-                            f"Species {completed_species}/{worker_total}: "
-                            f"{result.species} could not be included because "
-                            "its eligible protein data could not be retrieved "
-                            "from NCBI."
+                    recovered_accessions = tuple(
+                        sorted(
+                            assembly.accession
+                            for assembly
+                            in recovery_job.assemblies
+                            if bool(
+                                state.conn.execute(
+                                    """
+                                    SELECT protein_fasta_available
+                                    FROM assemblies
+                                    WHERE accession=?
+                                    """,
+                                    (
+                                        assembly.accession,
+                                    ),
+                                ).fetchone()[
+                                    "protein_fasta_available"
+                                ]
+                            )
                         )
+                    )
+
+                    recovery_summaries[
+                        recovery_job.species.taxid
+                    ].recovered_accessions = (
+                        recovered_accessions
+                    )
+
+                    recovered_assemblies += (
+                        recovery_result.successful_assemblies
+                    )
+
+                    still_failed_assemblies += (
+                        recovery_result.attempted_assemblies
+                        - recovery_result.successful_assemblies
+                    )
+
+            info(
+                "Automatic restorative recovery pass complete: "
+                f"{recovered_assemblies:,}/"
+                f"{recovery_assembly_total:,} assemblies recovered; "
+                f"{still_failed_assemblies:,} still unavailable."
+            )
 
     finally:
         manager.shutdown()
+
+    return recovery_summaries
+
+
+def report_unresolved_ncbi_recovery_warning(
+    state: StateDB,
+    recovery_species_taxids: set[int],
+) -> None:
+    """Warn about unresolved NCBI failures after final selection."""
+
+    if not recovery_species_taxids:
+        return
+
+    retryable_reasons = (
+        "NCBI_REQUEST_TIMEOUT",
+        "NCBI_RATE_LIMITED",
+        "NCBI_GATEWAY_ERROR",
+        "NCBI_REQUEST_FAILED",
+    )
+
+    failure_rows = state.conn.execute(
+        """
+        SELECT DISTINCT
+            a.species_taxid,
+            a.accession
+        FROM failed_downloads AS f
+        JOIN assemblies AS a
+          ON a.accession = f.assembly
+        WHERE f.reason IN (?, ?, ?, ?)
+        """,
+        retryable_reasons,
+    ).fetchall()
+
+    unresolved = {
+        (int(row[0]), str(row[1]))
+        for row in failure_rows
+        if int(row[0]) in recovery_species_taxids
+    }
+
+    if not unresolved:
+        return
+
+    affected_species = {
+        taxid
+        for taxid, _accession in unresolved
+    }
+
+    represented_species = {
+        int(row[0])
+        for row in state.conn.execute(
+            """
+            SELECT DISTINCT species_taxid
+            FROM assemblies
+            WHERE selected = 1
+              AND protein_fasta_available = 1
+            """
+        ).fetchall()
+    }
+
+    unrepresented_affected = (
+        affected_species - represented_species
+    )
+
+    represented_affected = (
+        affected_species & represented_species
+    )
+
+    unresolved_count = len({
+        accession
+        for _taxid, accession in unresolved
+    })
+
+    if unrepresented_affected:
+        warn(
+            "Automatic NCBI recovery left "
+            f"{unresolved_count:,} assembly retrieval failures unresolved.\n"
+            f"         {len(unrepresented_affected):,} affected species "
+            "have no usable selected proteins and still have unresolved "
+            "NCBI retrieval failures.\n"
+            f"         {len(represented_affected):,} other affected species "
+            "remain represented by usable assemblies.\n"
+            "         Unresolved NCBI failures have been preserved "
+            "for future retry."
+        )
+    else:
+        warn(
+            "Automatic NCBI recovery left "
+            f"{unresolved_count:,} assembly retrieval failures unresolved.\n"
+            "         All affected species remain represented "
+            "by at least one usable assembly.\n"
+            "         Unresolved NCBI failures have been preserved "
+            "for future retry."
+        )
+
+
+def finalize_create_selection(
+    state: StateDB,
+    species_map: Mapping[int, SpeciesCandidate],
+    pools: Mapping[int, list[AssemblyRecord]],
+    config: BuildConfig,
+    *,
+    selection_constraints_by_species: Mapping[
+        int,
+        AssemblySelectionConstraints,
+    ] | None = None,
+) -> None:
+    """Resolve the final CREATE selection from known protein availability."""
+
+    policy = assembly_selection_policy(
+        config
+    )
+
+    active_constraints_by_species = (
+        selection_constraints_by_species
+        if selection_constraints_by_species is not None
+        else {}
+    )
+
+    for taxid in species_map:
+
+        current_pool = pools.get(
+            taxid,
+            [],
+        )
+
+        if not current_pool:
+            continue
+
+        usable_accessions: set[str] = set()
+
+        for assembly in current_pool:
+
+            row = state.conn.execute(
+                """
+                SELECT protein_fasta_available
+                FROM assemblies
+                WHERE accession=?
+                """,
+                (assembly.accession,),
+            ).fetchone()
+
+            if (
+                row is not None
+                and bool(
+                    row["protein_fasta_available"]
+                )
+            ):
+                usable_accessions.add(
+                    assembly.accession
+                )
+
+        resolution = execute_assembly_selection(
+            current_pool,
+            policy,
+            lambda assembly: (
+                assembly.accession
+                in usable_accessions
+            ),
+            constraints=(
+                active_constraints_by_species.get(
+                    taxid,
+                    AssemblySelectionConstraints(),
+                )
+            ),
+        )
+
+        selected = (
+            resolution.selected_accessions
+        )
+
+        with state.conn:
+
+            for assembly in current_pool:
+
+                accession = assembly.accession
+
+                if accession not in usable_accessions:
+                    # Failed/unavailable candidates keep their specific
+                    # processing reason.
+                    continue
+
+                if accession not in selected:
+
+                    state.conn.execute(
+                        """
+                        DELETE FROM sources
+                        WHERE assembly=?
+                        """,
+                        (accession,),
+                    )
+
+                    state.conn.execute(
+                        """
+                        DELETE FROM protein_warnings
+                        WHERE assembly=?
+                        """,
+                        (accession,),
+                    )
+
+                    reason = (
+                        resolution.not_selected_reasons.get(
+                            accession
+                        )
+                    )
+
+                    if reason is None:
+                        raise DataIntegrityError(
+                            "CREATE final selection returned a usable "
+                            "unselected candidate without an explicit "
+                            "NOT_SELECTED reason: "
+                            f"{accession}"
+                        )
+
+                    state.conn.execute(
+                        """
+                        UPDATE assemblies
+                        SET selected=0,
+                            final_status='NOT_SELECTED',
+                            final_reason=?
+                        WHERE accession=?
+                        """,
+                        (
+                            reason,
+                            accession,
+                        ),
+                    )
+
+                else:
+
+                    state.conn.execute(
+                        """
+                        UPDATE assemblies
+                        SET selected=1,
+                            final_status='PROCESSED',
+                            final_reason='PASS'
+                        WHERE accession=?
+                        """,
+                        (accession,),
+                    )
+
+            state.conn.execute(
+                """
+                UPDATE species
+                SET state='PREPARED'
+                WHERE taxid=?
+                """,
+                (taxid,),
+            )
+
+
+def selected_assembly_accessions(
+    state: StateDB,
+    species_taxid: int,
+) -> tuple[str, ...]:
+    """Return the final selected assembly accessions for one species."""
+
+    return tuple(
+        str(row["accession"])
+        for row in state.conn.execute(
+            """
+            SELECT accession
+            FROM assemblies
+            WHERE species_taxid=?
+              AND selected=1
+            ORDER BY accession
+            """,
+            (species_taxid,),
+        )
+    )
+
+
+def report_ncbi_recovery_selection_updates(
+    state: StateDB,
+    recovery_summaries: Mapping[
+        int,
+        NCBIRecoverySummary,
+    ],
+    *,
+    include_selected_assemblies: bool = True,
+) -> None:
+    """Report final biological selection after automatic NCBI recovery."""
+
+    if not recovery_summaries:
+        return
+
+    ordered_summaries = sorted(
+        recovery_summaries.values(),
+        key=lambda summary: (
+            summary.species,
+            summary.species_taxid,
+        ),
+    )
+
+    total_species = len(
+        ordered_summaries
+    )
+
+    progress_width = max(
+        1,
+        len(str(total_species)),
+    )
+
+    for index, summary in enumerate(
+        ordered_summaries,
+        start=1,
+    ):
+        selected_after = (
+            selected_assembly_accessions(
+                state,
+                summary.species_taxid,
+            )
+        )
+
+        selected_before_set = set(
+            summary.selected_before_recovery
+        )
+
+        selected_after_set = set(
+            selected_after
+        )
+
+        added = tuple(
+            sorted(
+                selected_after_set
+                - selected_before_set
+            )
+        )
+
+        removed = tuple(
+            sorted(
+                selected_before_set
+                - selected_after_set
+            )
+        )
+
+        selection_updated = bool(
+            added or removed
+        )
+
+        retried = len(
+            summary.retried_accessions
+        )
+
+        recovered = len(
+            summary.recovered_accessions
+        )
+
+        still_failed = (
+            retried - recovered
+        )
+
+        lines = [
+            (
+                f"Species {index:>{progress_width}}/{total_species} "
+                f"{'RECOVERY':<12}: "
+                f"{summary.species}"
+            ),
+            (
+                "       "
+                f"Assemblies retried={retried} | "
+                f"Recovered={recovered} | "
+                f"Still failed={still_failed}"
+            ),
+            (
+                "       "
+                "Final selection="
+                + (
+                    "UPDATED"
+                    if selection_updated
+                    else "UNCHANGED"
+                )
+            ),
+        ]
+
+        if include_selected_assemblies:
+            lines.append(
+                "       "
+                f"Assemblies included ({len(selected_after)}): "
+                + (
+                    ", ".join(selected_after)
+                    if selected_after
+                    else "none"
+                )
+            )
+
+        if selection_updated:
+            changes: list[str] = []
+
+            if removed:
+                changes.append(
+                    "removed "
+                    + ", ".join(removed)
+                )
+
+            if added:
+                changes.append(
+                    "added "
+                    + ", ".join(added)
+                )
+
+            lines.append(
+                "       Selection change: "
+                + " | ".join(changes)
+            )
+
+        info(
+            "\n".join(lines)
+        )
 
 
 def finalize_update_selection(
@@ -11794,6 +12945,7 @@ def finalize_update_selection(
         int,
         AssemblySelectionConstraints,
     ] | None = None,
+    report_messages: list[str] | None = None,
 ) -> None:
     """Resolve the final update selection after protein availability is known.
 
@@ -12062,9 +13214,12 @@ def finalize_update_selection(
                     )
                 )
 
-            info(
-                "\n".join(lines)
-            )
+            message = "\n".join(lines)
+
+            if report_messages is None:
+                info(message)
+            else:
+                report_messages.append(message)
 
     reconcile_final_assembly_update_changes(
         state,
@@ -12104,7 +13259,11 @@ def rebuild_global_canonical_store(state: StateDB, work_root: Path, old: OldRefe
     We never load all protein hashes/sequences into RAM. Membership is queried
     through SQLite and sequence bytes live in an append-only canonical file.
     """
-    ready_dir = work_root / TMP_DIR / "prepared_species"
+    ready_dirs = (
+        work_root / TMP_DIR / "prepared_species",
+        work_root / TMP_DIR / "ncbi_recovery_prepared_species",
+    )
+
     store_final = work_root / CANONICAL_STORE_REL
     store_part = store_final.with_name(store_final.name + ".part")
     store_final.parent.mkdir(parents=True, exist_ok=True)
@@ -12114,25 +13273,32 @@ def rebuild_global_canonical_store(state: StateDB, work_root: Path, old: OldRefe
         state.conn.execute("DELETE FROM canonical_sequences")
 
     with store_part.open("w+b") as store:
-        # Worker .ready files may contain proteins from new or changed assemblies
-        # that were processed successfully but were not retained by the final
-        # assembly-selection policy.
-        #
-        # Add a protein to the global canonical store only if it still has
-        # provenance from a selected assembly in state.sources.
-        if ready_dir.exists():
-            for fasta_path in sorted(ready_dir.glob("Species_*.faa.ready")):
+        # First-pass and recovery .ready files may contain proteins from
+        # assemblies that are not retained by the final biological selection.
+        # Only hashes that still have selected provenance in state.sources enter
+        # the global canonical store.
+        for ready_dir in ready_dirs:
+
+            if not ready_dir.exists():
+                continue
+
+            for fasta_path in sorted(
+                ready_dir.glob("Species_*.faa.ready")
+            ):
                 if fasta_path.stat().st_size == 0:
                     continue
+
                 for rec in stream_fasta(fasta_path):
-                    sequence, terminal, _ = canonicalize_protein(
-                        rec.sequence
+                    sequence, terminal, _internal = (
+                        canonicalize_protein(
+                            rec.sequence
+                        )
                     )
 
                     if terminal:
                         raise DataIntegrityError(
-                            "Prepared FASTA unexpectedly contains terminal stop: "
-                            f"{fasta_path}"
+                            "Prepared FASTA unexpectedly contains terminal "
+                            f"stop: {fasta_path}"
                         )
 
                     digest = hashlib.sha256(
@@ -12158,7 +13324,8 @@ def rebuild_global_canonical_store(state: StateDB, work_root: Path, old: OldRefe
                         digest,
                         sequence,
                     )
-            state.conn.commit()
+
+        state.conn.commit()
 
         # Unchanged assemblies are reused during updates, so they do not produce a
         # new worker FASTA. If one of their protein hashes is not already present in
@@ -12720,14 +13887,14 @@ def warn_incomplete_ncbi_protein_coverage(
         return
 
     warn(
-        "Protein coverage is incomplete because NCBI retrieval could not be "
-        f"completed for {affected_species} retained species.\n\n"
+        "Protein coverage remains incomplete after automatic restorative "
+        "NCBI recovery because retrieval could not be completed for "
+        f"{affected_species} retained species.\n\n"
         "          Details:\n"
         "          reports/species_without_protein_FASTA.tsv\n"
         "          reports/failed_downloads.tsv\n\n"
-        "          If complete coverage is required, retry retrieval later by "
-        "updating\n"
-        "          this completed reference when NCBI access is stable."
+        "          If complete coverage is required, update this completed "
+        "reference later when NCBI access is stable."
     )
 
 
@@ -16031,7 +17198,7 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                         "identified by the comparison."
                     )
 
-                run_species_workers(
+                recovery_summaries = run_species_workers(
                     state,
                     species_map,
                     delta_pools,
@@ -16046,6 +17213,8 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                     "updated reference selection."
                 )
 
+                selection_report_messages: list[str] = []
+
                 finalize_update_selection(
                     state,
                     species_map,
@@ -16056,7 +17225,17 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                     selection_constraints_by_species=(
                         selection_constraints_by_species
                     ),
+                    report_messages=selection_report_messages,
                 )
+
+                report_ncbi_recovery_selection_updates(
+                    state,
+                    recovery_summaries,
+                    include_selected_assemblies=False,
+                )
+
+                for message in selection_report_messages:
+                    info(message)
 
                 info(
                     "Updated reference selection complete."
@@ -16070,7 +17249,7 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                     "Starting protein processing for eligible assembly candidates."
                 )
 
-                run_species_workers(
+                recovery_summaries = run_species_workers(
                     state,
                     species_map,
                     full_pools,
@@ -16081,6 +17260,21 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                         selection_constraints_by_species
                     ),
                     update_mode=False,
+                )
+
+                finalize_create_selection(
+                    state,
+                    species_map,
+                    full_pools,
+                    config,
+                    selection_constraints_by_species=(
+                        selection_constraints_by_species
+                    ),
+                )
+
+                report_ncbi_recovery_selection_updates(
+                    state,
+                    recovery_summaries,
                 )
 
             # Mark protein processing as complete without changing its results.
@@ -16130,6 +17324,11 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                 f"{selected_assemblies:,} assemblies selected; "
                 f"{protein_sources:,} protein source records; "
                 f"{species_without_proteins:,} species without usable selected proteins."
+            )
+
+            report_unresolved_ncbi_recovery_warning(
+                state,
+                set(recovery_summaries),
             )
 
             print_section_separator()
