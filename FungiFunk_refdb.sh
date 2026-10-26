@@ -13,7 +13,7 @@ TEMPLATE_DIR="${script_dir}/FungiFunk_refdb_templates"
 
 # Define the name, version and final output file of the tool
 TOOL_NAME="FungiFunk_refdb"
-VERSION="0.3.0"
+VERSION="0.3.1"
 FINAL_FASTA_NAME="FungiFunk_protein_refdb.faa"
 
 # Internal paths used by FungiFunk_refdb
@@ -214,6 +214,26 @@ Help() {
     echo "      approximately the existing database size plus the new reference workspace"
     echo "      and normal worker temporary space."
     echo ""
+    echo "  --retry-ncbi-failures"
+    echo "    Retry unresolved NCBI protein retrieval failures recorded in an existing"
+    echo "    completed FungiFunk_refdb reference."
+    echo ""
+    echo "    Required:"
+    echo "        --source-refdb <dir>"
+    echo ""
+    echo "    This mode preserves the original biological configuration and db_version."
+    echo "    It retries only eligible persisted NCBI failures; it does not perform a"
+    echo "    new assembly inventory search or download unchanged assemblies."
+    echo ""
+    echo "    Recovered proteins are incorporated, final biological selection is"
+    echo "    recalculated, and the reference is rebuilt and validated in isolated"
+    echo "    staging before safely replacing the original."
+    echo ""
+    echo "    If no assemblies are recovered, the reference remains unchanged."
+    echo "    Unresolved failures remain recorded for subsequent attempts."
+    echo ""
+    echo "    --outdir, --db-version, --resume and biological configuration changes"
+    echo "    cannot be combined with this mode."
     echo ""
     echo "##########################"
     echo " BIOLOGICAL CONFIGURATION "
@@ -437,11 +457,14 @@ Help() {
     echo ""
     echo "  -o, --outdir <dir>"
     echo "      Target/current FungiFunk_refdb directory."
-    echo "      Required in every run mode."
+    echo "      Required in all run modes except --retry-ncbi-failures."
     echo ""
     echo "  --source-refdb <dir>"
-    echo "      Completed and validated previous FungiFunk_refdb database used by"
-    echo "      --create-new-updated-version."
+    echo "      Completed and validated FungiFunk_refdb reference."
+    echo "    Required by --create-new-updated-version and --retry-ncbi-failures."
+    echo ""
+    echo "    During manual NCBI recovery, this identifies the completed reference"
+    echo "    that will be safely updated in place."
     echo ""
     echo "  --tmpdir <dir>"
     echo "      Optional alternative temporary workspace."
@@ -1133,6 +1156,16 @@ Help() {
     echo "      --outdir FungiFunk_refdb"
     echo ""
     echo ""
+    echo "-> Retry previously failed NCBI protein downloads in a completed reference:"
+    echo ""
+    echo "FungiFunk_refdb.sh \\"
+    echo "    --retry-ncbi-failures \\"
+    echo "    --source-refdb FungiFunk_refdb"
+    echo ""
+    echo "Biological configuration and database version are preserved."
+    echo "The original reference remains unchanged if no proteins are recovered."
+    echo ""
+    echo ""
     echo "##########################"
     echo "          NOTES           "
     echo "##########################"
@@ -1543,6 +1576,11 @@ while [[ "$#" -gt 0 ]]; do
             shift
             ;;
 
+        --retry-ncbi-failures)
+            set_run_mode "retry-ncbi-failures"
+            shift
+            ;;
+
         -o|--outdir)
             require_value "$1" "$#"
             OUTDIR="$2"
@@ -1659,14 +1697,32 @@ done
 # Validate arguments
 ########################################################################################################
 if [[ "$RUN_MODE_COUNT" -eq 0 ]]; then
-    log_msg "[ERROR] No run mode was specified. Choose exactly one of --create, --resume, --create-new-updated-version, or --overwrite-with-updated-version."
+    log_msg "[ERROR] No run mode was specified. Choose exactly one of --create, --resume, --create-new-updated-version, --overwrite-with-updated-version, or --retry-ncbi-failures."
     Help
     exit 2
 fi
 
-if [[ -z "$OUTDIR" ]]; then
-    log_msg "[ERROR] --outdir is required in every run mode." >&2
+if [[ "$RUN_MODE" == "retry-ncbi-failures" ]]; then
+
+    if [[ -n "$OUTDIR" ]]; then
+        log_msg "[ERROR] --retry-ncbi-failures uses --source-refdb; --outdir must not be supplied." >&2
+        exit 2
+    fi
+
+    if [[ -z "$SOURCE_REFDB" ]]; then
+        log_msg "[ERROR] --retry-ncbi-failures requires --source-refdb DIR." >&2
+        exit 2
+    fi
+
+    # Reuse the source path internally for wrapper path validation and logging.
+    # The original CLI arguments are forwarded unchanged to Python.
+    OUTDIR="$SOURCE_REFDB"
+
+elif [[ -z "$OUTDIR" ]]; then
+
+    log_msg "[ERROR] --outdir is required with --${RUN_MODE}." >&2
     exit 2
+
 fi
 
 
@@ -1817,6 +1873,32 @@ case "$RUN_MODE" in
         fi
         ;;
 
+    retry-ncbi-failures)
+        require_completed_refdb_skeleton "$SOURCE_REFDB_CANON" "--source-refdb"
+
+        recovery_parent="$(dirname -- "$SOURCE_REFDB_CANON")"
+        recovery_name="$(basename -- "$SOURCE_REFDB_CANON")"
+
+        recovery_staging="${recovery_parent}/.${recovery_name}.FungiFunk_refdb_recovery_staging"
+        recovery_backup="${recovery_parent}/.${recovery_name}.FungiFunk_refdb_previous_backup"
+
+        if [[ -e "$recovery_staging" || -L "$recovery_staging" ]]; then
+            log_msg "[ERROR] A previous manual NCBI recovery staging path already exists:" >&2
+            log_msg "        $recovery_staging" >&2
+            log_msg "        Check that no recovery process is still running." >&2
+            log_msg "        Inspect and remove the incomplete staging directory manually before retrying." >&2
+            exit 2
+        fi
+
+        if [[ -e "$recovery_backup" || -L "$recovery_backup" ]]; then
+            log_msg "[ERROR] A previous safe-overwrite backup exists:" >&2
+            log_msg "        $recovery_backup" >&2
+            log_msg "        Inspect this backup before starting manual NCBI recovery." >&2
+            log_msg "        FungiFunk_refdb will not delete it automatically." >&2
+            exit 2
+        fi
+        ;;
+
     *)
         log_msg "[ERROR] Internal wrapper error: unsupported run mode '$RUN_MODE'." >&2
         exit 2
@@ -1871,8 +1953,10 @@ fi
 # Prepare log file and write run metadata
 ########################################################################################################
 
-# Define the run metadata log file
-if [[ "$RUN_MODE" == "overwrite-with-updated-version" ]]; then
+# Define the run metadata log file.
+# Staged replacement modes must not modify the original reference.
+if [[ "$RUN_MODE" == "overwrite-with-updated-version" ||
+      "$RUN_MODE" == "retry-ncbi-failures" ]]; then
 
     # Write the run metadata log to a temporary file beside the existing database
     # so the old reference is not modified during the staged update
@@ -2009,6 +2093,33 @@ FUNGIFUNK_WRAPPER_RUN_INFO_LOG="$run_info_log" \
 PYTHON_STATUS=$?
 set -e
 
+# Manual recovery can complete successfully without publishing changes.
+# Require an unambiguous receipt from the Python process.
+RECOVERY_ACTION=""
+
+if [[ "$RUN_MODE" == "retry-ncbi-failures" &&
+      "$PYTHON_STATUS" -eq 0 ]]; then
+
+    if grep -Fxq 'Manual_recovery_action: PROMOTE' "$run_info_log" &&
+       ! grep -Fxq 'Manual_recovery_action: NO_CHANGE' "$run_info_log"; then
+
+        RECOVERY_ACTION="PROMOTE"
+
+    elif grep -Fxq 'Manual_recovery_action: NO_CHANGE' "$run_info_log" &&
+         ! grep -Fxq 'Manual_recovery_action: PROMOTE' "$run_info_log"; then
+
+        RECOVERY_ACTION="NO_CHANGE"
+
+    else
+
+        log_msg "[ERROR] Manual NCBI recovery returned no unambiguous publication status."
+        log_msg "[ERROR] Refusing to append recovery logs to the reference."
+        PYTHON_STATUS=1
+
+    fi
+
+fi
+
 
 ########################################################################################################
 # Finalise run metadata log and run status
@@ -2026,15 +2137,40 @@ fi
 # Relocate and finalize the run metadata log after overwrite operations
 ########################################################################################################
 
-if [[ "$RUN_MODE" == "overwrite-with-updated-version" ]]; then
+if [[ "$RUN_MODE" == "overwrite-with-updated-version" ||
+      "$RUN_MODE" == "retry-ncbi-failures" ]]; then
 
     overwrite_parent="$(dirname -- "$OUTDIR_CANON")"
     overwrite_name="$(basename -- "$OUTDIR_CANON")"
 
-    # This path must match the deterministic staging directory used by FungiFunk_refdb.py.
-    staging_dir="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_update_staging"
+    # Keep staging names consistent with the Python implementation.
+    if [[ "$RUN_MODE" == "retry-ncbi-failures" ]]; then
+        staging_dir="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_recovery_staging"
+    else
+        staging_dir="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_update_staging"
+    fi
 
-    if [[ "$PYTHON_STATUS" -eq 0 ]]; then
+    if [[ "$PYTHON_STATUS" -eq 0 &&
+          "$RUN_MODE" == "retry-ncbi-failures" &&
+          "$RECOVERY_ACTION" == "NO_CHANGE" ]]; then
+
+        # Python completed without publishing anything. Do not write logs
+        # into the unchanged original reference.
+        unchanged_run_info_log="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_recovery_no_changes.log"
+
+        if cat -- "$run_info_log" >> "$unchanged_run_info_log"; then
+
+            rm -f -- "$run_info_log"
+            run_info_log="$unchanged_run_info_log"
+
+        else
+
+            log_msg "[ERROR] Could not preserve the no-change recovery log."
+            log_msg "[ERROR] Temporary run metadata log preserved at: ${run_info_log}"
+
+        fi
+
+    elif [[ "$PYTHON_STATUS" -eq 0 ]]; then
 
         # Python has completed and validated the staged reference and has already
         # promoted it to OUTDIR_CANON.
@@ -2087,7 +2223,11 @@ if [[ "$RUN_MODE" == "overwrite-with-updated-version" ]]; then
         #
         # Keep the failure log beside the reference rather than writing anything
         # inside the still-valid original database.
-        failed_run_info_log="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_update_failed.log"
+        if [[ "$RUN_MODE" == "retry-ncbi-failures" ]]; then
+            failed_run_info_log="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_recovery_failed.log"
+        else
+            failed_run_info_log="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_update_failed.log"
+        fi
 
         if cat -- "$run_info_log" >> "$failed_run_info_log"; then
 

@@ -46,7 +46,7 @@ except ImportError:
 ########################################################################################################
 
 TOOL_NAME = "FungiFunk_refdb"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 FINAL_FASTA_NAME = "FungiFunk_protein_refdb.faa"
 
 ESTIMATED_RAM_GIB_PER_WORKER = 1.0
@@ -1609,8 +1609,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     mode.add_argument("--resume", action="store_true")
     mode.add_argument("--create-new-updated-version", action="store_true")
     mode.add_argument("--overwrite-with-updated-version", action="store_true")
+    mode.add_argument("--retry-ncbi-failures", action="store_true")
 
-    p.add_argument("-o", "--outdir", required=True)
+    p.add_argument("-o", "--outdir")
     p.add_argument("--source-refdb")
     p.add_argument("--seed-taxa")
     p.add_argument("--exclude-taxa")
@@ -1722,6 +1723,8 @@ def detect_run_mode(ns: argparse.Namespace) -> str:
         return "create-new-updated-version"
     if ns.overwrite_with_updated_version:
         return "overwrite-with-updated-version"
+    if ns.retry_ncbi_failures:
+        return "retry-ncbi-failures"
     raise ConfigError("Exactly one run mode is required.")
 
 
@@ -2000,8 +2003,6 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
 
     run_mode = detect_run_mode(ns)
 
-    outdir = str(Path(ns.outdir).expanduser().resolve())
-
     source = (
         str(Path(ns.source_refdb).expanduser().resolve())
         if ns.source_refdb
@@ -2011,6 +2012,51 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
     explicit = namespace_explicit_values(ns)
 
     reset_biological_config = bool(ns.reset_biological_config)
+
+    if run_mode == "retry-ncbi-failures":
+
+        if ns.outdir is not None:
+            raise ConfigError(
+                "--retry-ncbi-failures uses --source-refdb; "
+                "--outdir must not be supplied."
+            )
+
+        if source is None:
+            raise ConfigError(
+                "--retry-ncbi-failures requires --source-refdb."
+            )
+
+        forbidden_options = {
+            "--" + name.replace("_", "-")
+            for name in BIOLOGICAL_ARG_FIELDS | BIOLOGICAL_INPUT_ARG_FIELDS
+            if explicit.get(name) is not None
+        }
+
+        if reset_biological_config:
+            forbidden_options.add("--reset-biological-config")
+
+        if ns.db_version is not None:
+            forbidden_options.add("--db-version")
+
+        if forbidden_options:
+            raise ConfigError(
+                "--retry-ncbi-failures cannot change biological configuration "
+                "or database identity. Unsupported option(s): "
+                + ", ".join(sorted(forbidden_options))
+            )
+
+        # Manual recovery repairs the existing reference in place.
+        # A separate staging directory will be selected before any writes.
+        outdir = source
+
+    else:
+
+        if ns.outdir is None:
+            raise ConfigError(
+                f"--outdir is required with --{run_mode}."
+            )
+
+        outdir = str(Path(ns.outdir).expanduser().resolve())
 
     explicit_species_mode = (
         explicit.get("max_assemblies_per_species") is not None
@@ -2127,6 +2173,12 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
             else load_json(Path(source) / CONFIG_JSON_REL)
         )
 
+    elif run_mode == "retry-ncbi-failures":
+
+        # Reuse the exact biological configuration of the completed reference.
+        # No new curation or biological overrides are permitted.
+        base = load_json(Path(source) / CONFIG_JSON_REL)
+
     else:  # pragma: no cover
         raise ConfigError(f"Unknown run mode {run_mode}")
 
@@ -2176,7 +2228,7 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
         "build_started",
     }
 
-    if run_mode != "resume":
+    if run_mode not in {"resume", "retry-ncbi-failures"}:
         non_inherited_fields.add("db_version")
 
     # During a pre-assembly resume with --reset-biological-config, preserve the
@@ -9674,6 +9726,52 @@ def build_ncbi_recovery_job(
     )
 
 
+def pending_manual_ncbi_recovery_accessions(
+    state: StateDB,
+) -> dict[int, tuple[str, ...]]:
+    """Find unresolved NCBI retrieval failures in a completed reference.
+
+    Include failed preferred assemblies even when another assembly already
+    represents the species. Never retry assemblies with usable proteins.
+    """
+    retryable_reasons = (
+        "NCBI_REQUEST_TIMEOUT",
+        "NCBI_RATE_LIMITED",
+        "NCBI_GATEWAY_ERROR",
+        "NCBI_REQUEST_FAILED",
+    )
+
+    placeholders = ",".join("?" for _ in retryable_reasons)
+
+    rows = state.conn.execute(
+        f"""
+        SELECT DISTINCT
+            a.species_taxid AS taxid,
+            a.accession AS accession
+        FROM failed_downloads AS fd
+        JOIN assemblies AS a
+          ON a.accession = fd.assembly
+         AND a.species_taxid = fd.species_taxid
+        WHERE fd.reason IN ({placeholders})
+          AND COALESCE(a.protein_fasta_available, 0) = 0
+        ORDER BY a.species_taxid, a.accession
+        """,
+        retryable_reasons,
+    ).fetchall()
+
+    pending: dict[int, list[str]] = {}
+
+    for row in rows:
+        pending.setdefault(int(row["taxid"]), []).append(
+            str(row["accession"])
+        )
+
+    return {
+        taxid: tuple(accessions)
+        for taxid, accessions in pending.items()
+    }
+
+
 def validate_species_products(fasta_path: Path, sqlite_path: Path, expected_assemblies: Sequence[str]) -> tuple[int, int]:
     conn = sqlite3.connect(sqlite_path)
     conn.row_factory = sqlite3.Row
@@ -11243,6 +11341,96 @@ def assembly_from_db_row(row: sqlite3.Row) -> AssemblyRecord:
     return AssemblyRecord(**kwargs)
 
 
+def load_manual_ncbi_recovery_selection_context(
+    state: StateDB,
+    work_root: Path,
+    *,
+    resolved_targets_out: list[ResolvedExplicitTarget] | None = None,
+) -> tuple[
+    dict[int, SpeciesCandidate],
+    dict[int, list[AssemblyRecord]],
+    dict[int, AssemblySelectionConstraints],
+]:
+    """Reconstruct the original selection context without NCBI discovery.
+
+    Species and assembly candidates come from the completed persistent state.
+    Explicit-target rules and their resolved identities come exclusively from
+    the immutable configuration snapshots copied into recovery staging.
+    """
+    config_dir = work_root / CONFIG_DIR
+
+    for name in (SEED_SNAPSHOT, EXCLUSION_SNAPSHOT):
+        snapshot = config_dir / name
+        if not snapshot.is_file():
+            raise DataIntegrityError(
+                "Manual NCBI recovery requires the original biological "
+                f"configuration snapshot: {snapshot}"
+            )
+
+    include_snapshot = (
+        config_dir / INCLUDE_EXPLICIT_TARGETS_SNAPSHOT
+    )
+    exclude_snapshot = (
+        config_dir / EXCLUDE_EXPLICIT_TARGETS_SNAPSHOT
+    )
+
+    include_rules = (
+        parse_explicit_targets(
+            include_snapshot,
+            action="include",
+            warn_if_empty=False,
+        )
+        if include_snapshot.is_file()
+        else []
+    )
+
+    exclude_rules = (
+        parse_explicit_targets(
+            exclude_snapshot,
+            action="exclude",
+            warn_if_empty=False,
+        )
+        if exclude_snapshot.is_file()
+        else []
+    )
+
+    resolved_targets = load_resolved_explicit_targets(
+        config_dir / RESOLVED_EXPLICIT_TARGETS_JSON,
+        [
+            *include_rules,
+            *exclude_rules,
+        ],
+    )
+
+    include_count = len(include_rules)
+
+    resolved_include_targets = resolved_targets[:include_count]
+    resolved_exclude_targets = resolved_targets[include_count:]
+
+    species_map = load_species_map_from_state(
+        state,
+        only_filter_pass=True,
+    )
+
+    full_pools = load_assembly_pool_from_state(
+        state,
+        species_map.keys(),
+    )
+
+    selection_constraints = (
+        build_assembly_selection_constraints_by_species(
+            species_map,
+            resolved_include_targets,
+            resolved_exclude_targets,
+        )
+    )
+
+    if resolved_targets_out is not None:
+        resolved_targets_out.extend(resolved_targets)
+
+    return species_map, full_pools, selection_constraints
+
+
 def load_species_map_from_state(state: StateDB, *, only_filter_pass: bool = True) -> dict[int, SpeciesCandidate]:
     sql = "SELECT * FROM species WHERE final_taxonomic_status='INCLUDED'"
     if only_filter_pass:
@@ -11410,10 +11598,22 @@ def write_resource_usage(path: Path, plan: ResourcePlan, config: BuildConfig) ->
 class OldReference:
     """Read-only view of a completed source FungiFunk_refdb."""
 
-    def __init__(self, root: Path):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        immutable_source: bool = False,
+    ):
         self.root = root
         db_path = root / STATE_DB_REL
+
+        # Preserve the original SQLite behavior for existing callers.
         uri = f"file:{db_path.as_posix()}?mode=ro"
+
+        # Manual recovery reads a validated, completed source reference
+        # that must remain completely unchanged.
+        if immutable_source:
+            uri = db_path.resolve().as_uri() + "?mode=ro&immutable=1"
         try:
             self.conn = sqlite3.connect(uri, uri=True, timeout=60.0)
         except sqlite3.Error as exc:
@@ -11919,7 +12119,26 @@ def run_species_workers(
         AssemblySelectionConstraints,
     ] | None = None,
     update_mode: bool = False,
+    recovery_only: bool = False,
 ) -> dict[int, NCBIRecoverySummary]:
+    if recovery_only and update_mode:
+        raise DataIntegrityError(
+            "Manual NCBI recovery cannot run as an ordinary update delta."
+        )
+
+    pending_manual = (
+        pending_manual_ncbi_recovery_accessions(state)
+        if recovery_only
+        else {}
+    )
+
+    if recovery_only and not pending_manual:
+        info(
+            "Manual NCBI recovery: no unresolved eligible NCBI "
+            "retrieval failures were found."
+        )
+        return {}
+
     ready_dir = work_root / TMP_DIR / "prepared_species"
     ready_dir.mkdir(parents=True, exist_ok=True)
     temp_base = Path(config.tmpdir) if config.tmpdir else work_root / TMP_DIR / "workers"
@@ -11928,7 +12147,7 @@ def run_species_workers(
     # Species with no candidate assembly are still valid members of the species
     # master and should be rechecked on future updates.
     for taxid, species in species_map.items():
-        if not pools.get(taxid):
+        if not recovery_only and not pools.get(taxid):
             with state.conn:
                 state.conn.execute("UPDATE species SET state='PREPARED' WHERE taxid=?", (taxid,))
 
@@ -12066,6 +12285,28 @@ def run_species_workers(
             timestamps=config.timestamps,
         )
 
+        if recovery_only:
+            requested = set(pending_manual.get(taxid, ()))
+
+            # Only previously eligible assembly candidates may be retried.
+            retry_accessions = [
+                assembly.accession
+                for assembly in assemblies
+                if assembly.accession in requested
+            ]
+
+            if retry_accessions:
+                recovery_jobs.append(
+                    build_ncbi_recovery_job(
+                        job,
+                        retry_accessions,
+                    )
+                )
+
+            # Skip first-pass checkpoint recovery, species state changes,
+            # and ordinary protein-processing worker scheduling.
+            continue
+
         db_row = state.conn.execute(
             """
             SELECT state
@@ -12150,6 +12391,27 @@ def run_species_workers(
             job
         )
 
+    if recovery_only:
+        queued = {
+            (job.species.taxid, assembly.accession)
+            for job in recovery_jobs
+            for assembly in job.assemblies
+        }
+
+        skipped = [
+            (taxid, accession)
+            for taxid, accessions in pending_manual.items()
+            for accession in accessions
+            if (taxid, accession) not in queued
+        ]
+
+        if skipped:
+            warn(
+                "Manual NCBI recovery skipped "
+                f"{len(skipped)} recorded failure(s) outside the "
+                "persisted eligible assembly candidate pools."
+            )
+
     if (
         not jobs
         and not recovery_jobs
@@ -12194,6 +12456,12 @@ def run_species_workers(
             f"NCBI access: up to {effective_ncbi_concurrency} concurrent "
             f"Datasets commands; request-start limit "
             f"{config.ncbi_request_rate:g}/s."
+        )
+
+    elif recovery_only:
+        info(
+            "Manual NCBI recovery: no first-pass workers scheduled; "
+            f"{len(recovery_jobs)} recovery species jobs queued."
         )
 
     else:
@@ -12370,10 +12638,16 @@ def run_species_workers(
 
             print(flush=True)
 
-            info(
-                "Starting automatic restorative recovery for assemblies "
-                "affected by NCBI retrieval failures."
-            )
+            if recovery_only:
+                info(
+                    "Starting manual restorative recovery for assemblies "
+                    "with unresolved NCBI retrieval failures."
+                )
+            else:
+                info(
+                    "Starting automatic restorative recovery for assemblies "
+                    "affected by NCBI retrieval failures."
+                )
 
             info(
                 f"Recovery queue: {recovery_assembly_total:,} assemblies "
@@ -12514,8 +12788,14 @@ def run_species_workers(
                         - recovery_result.successful_assemblies
                     )
 
+            recovery_label = (
+                "Manual NCBI recovery"
+                if recovery_only
+                else "Automatic restorative recovery"
+            )
+
             info(
-                "Automatic restorative recovery pass complete: "
+                f"{recovery_label} pass complete: "
                 f"{recovered_assemblies:,}/"
                 f"{recovery_assembly_total:,} assemblies recovered; "
                 f"{still_failed_assemblies:,} still unavailable."
@@ -12618,6 +12898,257 @@ def report_unresolved_ncbi_recovery_warning(
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class ManualNCBIRecoveryResult:
+    """Context retained for finalizing a manually recovered reference."""
+
+    recovered_count: int
+    resource_plan: ResourcePlan | None
+    explicit_targets: tuple[ResolvedExplicitTarget, ...]
+
+    @property
+    def changed(self) -> bool:
+        return self.recovered_count > 0
+
+
+def run_manual_ncbi_recovery_processing(
+    state: StateDB,
+    config: BuildConfig,
+    work_root: Path,
+    source_root: Path,
+) -> ManualNCBIRecoveryResult:
+    """Recover pending failures and retain finalization context.
+
+    The caller must rebuild and publish only when result.changed is True.
+    """
+    pending = pending_manual_ncbi_recovery_accessions(state)
+
+    if not pending:
+        info(
+            "Manual NCBI recovery: no unresolved eligible NCBI "
+            "retrieval failures remain."
+        )
+        return ManualNCBIRecoveryResult(
+            recovered_count=0,
+            resource_plan=None,
+            explicit_targets=(),
+        )
+
+    resolved_targets: list[ResolvedExplicitTarget] = []
+
+    species_map, full_pools, constraints = (
+        load_manual_ncbi_recovery_selection_context(
+            state,
+            work_root,
+            resolved_targets_out=resolved_targets,
+        )
+    )
+
+    eligible = {
+        (taxid, assembly.accession)
+        for taxid, assemblies in full_pools.items()
+        for assembly in assemblies
+    }
+
+    actionable = {
+        (taxid, accession)
+        for taxid, accessions in pending.items()
+        for accession in accessions
+        if (taxid, accession) in eligible
+    }
+
+    if not actionable:
+        warn(
+            "Manual NCBI recovery found persistent NCBI failures, "
+            "but none belong to the saved eligible assembly pools. "
+            "No recovery downloads or output reconstruction will be performed."
+        )
+        return False
+
+    info(
+        "Manual NCBI recovery: "
+        f"{len(actionable):,} eligible failed assemblies "
+        "identified from the completed reference."
+    )
+
+    print(flush=True)
+
+    print_section_banner("RESOURCE ASSESSMENT AND WORKER PLANNING")
+
+    temp_base = (
+        Path(config.tmpdir)
+        if config.tmpdir
+        else work_root / TMP_DIR / "workers"
+    )
+
+    plan = calculate_resource_plan(
+        config,
+        work_root,
+        temp_base,
+        source_root,
+    )
+
+    write_resource_usage(
+        work_root / REPORTS_DIR / "resource_usage.tsv",
+        plan,
+        config,
+    )
+
+    info(
+        "Manual NCBI recovery resource plan: "
+        f"{plan.used_workers} worker(s) allocated; "
+        "first-pass processing skipped."
+    )
+
+    print(flush=True)
+    state.set_global_state("PROTEIN_RETRIEVAL_AND_PROCESSING")
+
+    recovery_summaries = run_species_workers(
+        state,
+        species_map,
+        full_pools,
+        config,
+        work_root,
+        plan,
+        selection_constraints_by_species=constraints,
+        recovery_only=True,
+    )
+
+    recovered = sum(
+        len(summary.recovered_accessions)
+        for summary in recovery_summaries.values()
+    )
+
+    if recovered == 0:
+        info(
+            "Manual NCBI recovery did not recover any assemblies. "
+            "The original reference will be retained without "
+            "rebuilding final outputs."
+        )
+        return ManualNCBIRecoveryResult(
+            recovered_count=0,
+            resource_plan=plan,
+            explicit_targets=tuple(resolved_targets),
+        )
+
+    info(
+        f"Manual NCBI recovery obtained {recovered:,} assemblies. "
+        "Recalculating final biological selection."
+    )
+
+    finalize_manual_ncbi_recovery_selection(
+        state,
+        species_map,
+        full_pools,
+        config,
+        selection_constraints_by_species=constraints,
+    )
+
+    validate_manual_ncbi_selected_provenance(state)
+
+    state.set_global_state(
+        "PROTEIN_RETRIEVAL_AND_PROCESSING_COMPLETE"
+    )
+
+    report_ncbi_recovery_selection_updates(
+        state,
+        recovery_summaries,
+    )
+
+    return ManualNCBIRecoveryResult(
+        recovered_count=recovered,
+        resource_plan=plan,
+        explicit_targets=tuple(resolved_targets),
+    )
+
+
+def validate_manual_ncbi_selected_provenance(
+    state: StateDB,
+) -> None:
+    """Require persistent protein provenance for every selected assembly."""
+    missing = [
+        str(row["accession"])
+        for row in state.conn.execute(
+            """
+            SELECT a.accession
+            FROM assemblies AS a
+            WHERE a.selected=1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM sources AS s
+                  WHERE s.assembly=a.accession
+              )
+            ORDER BY a.accession
+            """
+        )
+    ]
+
+    if missing:
+        raise DataIntegrityError(
+            "Manual NCBI recovery cannot rebuild final outputs: "
+            f"{len(missing)} selected assemblies have no persisted "
+            "protein provenance. Examples: "
+            + ", ".join(missing[:10])
+        )
+
+
+def finalize_manual_ncbi_recovery_selection(
+    state: StateDB,
+    species_map: Mapping[int, SpeciesCandidate],
+    pools: Mapping[int, list[AssemblyRecord]],
+    config: BuildConfig,
+    *,
+    selection_constraints_by_species: Mapping[
+        int,
+        AssemblySelectionConstraints,
+    ] | None = None,
+) -> None:
+    """Re-select recovered assemblies using the original biological policy.
+
+    The staged SQLite already contains provenance for previously selected
+    assemblies. Reuse CREATE final selection rather than UPDATE comparison
+    and import logic. Preserve REUSED status for unchanged retained sources.
+    """
+    previously_reused = [
+        str(row["accession"])
+        for row in state.conn.execute(
+            """
+            SELECT accession
+            FROM assemblies
+            WHERE selected=1
+              AND final_status='REUSED'
+            ORDER BY accession
+            """
+        )
+    ]
+
+    finalize_create_selection(
+        state,
+        species_map,
+        pools,
+        config,
+        selection_constraints_by_species=(
+            selection_constraints_by_species
+        ),
+        require_source_provenance=True,
+    )
+
+    # CREATE finalization marks all selected candidates as PROCESSED.
+    # Preserve the original reuse provenance for assemblies that were
+    # already selected and remain selected after manual recovery.
+    with state.conn:
+        state.conn.executemany(
+            """
+            UPDATE assemblies
+            SET final_status='REUSED'
+            WHERE accession=?
+              AND selected=1
+              AND final_status='PROCESSED'
+            """,
+            [(accession,) for accession in previously_reused],
+        )
+
+
 def finalize_create_selection(
     state: StateDB,
     species_map: Mapping[int, SpeciesCandidate],
@@ -12628,6 +13159,7 @@ def finalize_create_selection(
         int,
         AssemblySelectionConstraints,
     ] | None = None,
+    require_source_provenance: bool = False,
 ) -> None:
     """Resolve the final CREATE selection from known protein availability."""
 
@@ -12665,14 +13197,31 @@ def finalize_create_selection(
             ).fetchone()
 
             if (
-                row is not None
-                and bool(
-                    row["protein_fasta_available"]
-                )
+                row is None
+                or not bool(row["protein_fasta_available"])
             ):
-                usable_accessions.add(
-                    assembly.accession
-                )
+                continue
+
+            if require_source_provenance:
+                has_sources = state.conn.execute(
+                    """
+                    SELECT 1
+                    FROM sources
+                    WHERE assembly=?
+                    LIMIT 1
+                    """,
+                    (assembly.accession,),
+                ).fetchone()
+
+                if has_sources is None:
+                    # A completed reference may retain availability metadata
+                    # for candidates whose protein provenance was discarded
+                    # after the original final selection.
+                    continue
+
+            usable_accessions.add(
+                assembly.accession
+            )
 
         resolution = execute_assembly_selection(
             current_pool,
@@ -15522,7 +16071,11 @@ def write_all_final_reports(
     )
 
 
-def print_reference_build_summary(final_root: Path) -> None:
+def print_reference_build_summary(
+    final_root: Path,
+    *,
+    immutable_source: bool = False,
+) -> None:
     """Print a concise summary of the final validated protein reference.
 
     This summary is intended for the user-facing end of a successful run. It
@@ -15563,8 +16116,16 @@ def print_reference_build_summary(final_root: Path) -> None:
 
     # Open the completed state database read-only. The summary must never modify
     # build state after the reference has already been finalized and validated.
+    # Preserve the existing connection behavior for ordinary builds.
+    uri = f"file:{state_db}?mode=ro"
+
+    # Manual recovery must not create WAL/SHM files in the completed
+    # original reference when printing the final summary.
+    if immutable_source:
+        uri = state_db.resolve().as_uri() + "?mode=ro&immutable=1"
+
     conn = sqlite3.connect(
-        f"file:{state_db}?mode=ro",
+        uri,
         uri=True,
     )
 
@@ -16053,6 +16614,305 @@ def overwrite_staging_path(target: Path) -> Path:
     return target.parent / f".{target.name}.FungiFunk_refdb_update_staging"
 
 
+def finalize_manual_ncbi_recovery_staging(
+    state: StateDB,
+    work_root: Path,
+    source_root: Path,
+    config: BuildConfig,
+    plan: ResourcePlan,
+    *,
+    explicit_targets: Sequence[ResolvedExplicitTarget],
+) -> None:
+    """Build and validate a recovered reference inside isolated staging.
+
+    Publication is intentionally excluded. The caller must close StateDB
+    before promoting the completed staging directory.
+    """
+    validate_manual_ncbi_selected_provenance(state)
+
+    old = OldReference(
+        source_root,
+        immutable_source=True,
+    )
+
+    try:
+        print(flush=True)
+
+        state.set_global_state("GLOBAL_EXACT_DEDUPLICATION")
+
+        info(
+            "Rebuilding the canonical protein store from recovered proteins "
+            "and existing source-reference sequences."
+        )
+
+        rebuild_global_canonical_store(
+            state,
+            work_root,
+            old,
+        )
+
+        state.set_global_state(
+            "GLOBAL_EXACT_DEDUPLICATION_COMPLETE"
+        )
+
+        protein_sources = int(
+            state.conn.execute(
+                "SELECT COUNT(*) FROM sources"
+            ).fetchone()[0]
+        )
+
+        unique_proteins = int(
+            state.conn.execute(
+                "SELECT COUNT(*) FROM canonical_sequences"
+            ).fetchone()[0]
+        )
+
+        if unique_proteins > protein_sources:
+            raise DataIntegrityError(
+                "Manual recovery produced more canonical sequences "
+                "than protein source occurrences."
+            )
+
+        info(
+            "Global exact deduplication complete: "
+            f"{protein_sources:,} source records; "
+            f"{unique_proteins:,} unique proteins; "
+            f"{protein_sources - unique_proteins:,} duplicate occurrences."
+        )
+
+        print(flush=True)
+
+        state.set_global_state("FINAL_OUTPUT_WRITING")
+
+        write_final_fasta_and_protein_metadata(
+            state,
+            work_root,
+        )
+
+        write_protein_sources(
+            state,
+            work_root,
+        )
+
+        state.set_global_state(
+            "FINAL_OUTPUT_WRITING_COMPLETE"
+        )
+
+        info("Recovered protein FASTA, metadata and provenance written.")
+
+        print(flush=True)
+
+        state.set_global_state("FINAL_REFERENCE_VALIDATION")
+
+        validate_final_reference(
+            state,
+            work_root,
+        )
+
+        state.set_global_state(
+            "FINAL_REFERENCE_VALIDATION_COMPLETE"
+        )
+
+        info("Recovered reference content validated.")
+
+        print(flush=True)
+
+        state.set_global_state("FINAL_REPORT_WRITING")
+
+        write_all_final_reports(
+            state,
+            work_root,
+            config,
+            plan,
+            explicit_targets=explicit_targets,
+        )
+
+        state.set_global_state(
+            "FINAL_REPORT_WRITING_COMPLETE"
+        )
+
+        warn_incomplete_ncbi_protein_coverage(state)
+
+        info("Recovered reference reports written.")
+
+        print(flush=True)
+
+        state.set_global_state("FINAL_CHECKPOINT")
+
+        with state.conn:
+            state.conn.execute(
+                """
+                UPDATE species
+                SET state='DONE'
+                WHERE state='PREPARED'
+                """
+            )
+
+        state.set_meta("completed", now_iso())
+
+        state.set_global_state(
+            "FINAL_CHECKPOINT_COMPLETE"
+        )
+
+        state.set_global_state("DONE")
+
+        # SQLite is part of the manifest: checkpoint before hashing.
+        state.checkpoint(truncate=True)
+
+        # The Bash wrapper requires this checkpoint to recognize a
+        # completed reference. Preserve the same filesystem contract
+        # for references published by manual NCBI recovery.
+        write_resume_ready_marker(work_root)
+
+        write_manifest(work_root)
+        verify_manifest(work_root)
+        write_completion_marker(work_root)
+
+        # Validate both the Python integrity contract and the
+        # filesystem checkpoints required by the Bash wrapper.
+        verify_completed_reference(work_root)
+
+        required_completion_files = (
+            work_root / RESUME_READY_REL,
+            work_root / DATABASE_DIR / FINAL_FASTA_NAME,
+            work_root / MANIFEST_REL,
+            work_root / COMPLETION_MARKER_REL,
+        )
+
+        missing_completion_files = [
+            str(path)
+            for path in required_completion_files
+            if not path.is_file()
+        ]
+
+        if missing_completion_files:
+            raise DataIntegrityError(
+                "Manual NCBI recovery staging is missing required "
+                "completion files:\n"
+                + "\n".join(missing_completion_files)
+            )
+
+        append_python_log(
+            work_root,
+            "DONE manual_ncbi_recovery=PASS "
+            "validation_and_manifest=PASS completion_marker=PASS",
+        )
+
+        info(
+            "Manual NCBI recovery staging complete. "
+            "Integrity manifest and completion marker verified."
+        )
+
+    finally:
+        old.close()
+
+
+def recovery_staging_path(target: Path) -> Path:
+    """Return the isolated staging directory for manual NCBI recovery."""
+    return target.parent / f".{target.name}.FungiFunk_refdb_recovery_staging"
+
+
+def prepare_manual_recovery_output_snapshot(
+    source: Path,
+    staging: Path,
+) -> None:
+    """Preserve previously completed outputs in isolated recovery staging.
+
+    Copy only published output directories. SQLite and biological config
+    are handled separately, and the canonical sequence store is rebuilt.
+    Never use hardlinks or symlinks to the original reference.
+    """
+    for directory_name in (
+        DATABASE_DIR,
+        METADATA_DIR,
+        REPORTS_DIR,
+    ):
+        source_dir = source / directory_name
+
+        if not source_dir.exists():
+            continue
+
+        if not source_dir.is_dir() or source_dir.is_symlink():
+            raise DataIntegrityError(
+                "Invalid original recovery output directory: "
+                f"{source_dir}"
+            )
+
+        for path in source_dir.rglob("*"):
+            if path.is_symlink():
+                raise DataIntegrityError(
+                    "Manual recovery cannot preserve linked output "
+                    f"files safely: {path}"
+                )
+
+        shutil.copytree(
+            source_dir,
+            staging / directory_name,
+            dirs_exist_ok=True,
+            copy_function=shutil.copy2,
+        )
+
+
+def prepare_manual_recovery_snapshot(source: Path, staging: Path) -> None:
+    """Copy the persistent recovery state without duplicating protein data.
+
+    SQLite is backed up through its own API to obtain an independent,
+    transactionally consistent database. The original canonical sequence
+    store remains available through OldReference during final deduplication.
+    """
+    source_db = source / STATE_DB_REL
+    staged_db = staging / STATE_DB_REL
+    source_config = source / CONFIG_JSON_REL
+    source_snapshots = source / CONFIG_DIR
+
+    if not source_db.is_file():
+        raise DataIntegrityError(
+            f"Source reference SQLite state is missing: {source_db}"
+        )
+
+    if not source_config.is_file():
+        raise DataIntegrityError(
+            f"Source reference configuration is missing: {source_config}"
+        )
+
+    if not source_snapshots.is_dir():
+        raise DataIntegrityError(
+            f"Source reference configuration snapshots are missing: "
+            f"{source_snapshots}"
+        )
+
+    staged_db.parent.mkdir(parents=True, exist_ok=True)
+
+    # Open the completed source database read-only. Never reuse its
+    # connection for writes or copy only the main file while WAL is active.
+    source_conn = sqlite3.connect(
+        source_db.resolve().as_uri() + "?mode=ro&immutable=1",
+        uri=True,
+        timeout=60.0,
+    )
+    staged_conn = None
+
+    try:
+        staged_conn = sqlite3.connect(staged_db, timeout=60.0)
+        source_conn.backup(staged_conn)
+        staged_conn.commit()
+    finally:
+        if staged_conn is not None:
+            staged_conn.close()
+        source_conn.close()
+
+    shutil.copy2(
+        source_config,
+        staging / CONFIG_JSON_REL,
+    )
+
+    shutil.copytree(
+        source_snapshots,
+        staging / CONFIG_DIR,
+        dirs_exist_ok=True,
+    )
+
+
 def choose_work_and_source_roots(
     config: BuildConfig,
 ) -> tuple[Path, Path | None, Path | None]:
@@ -16064,6 +16924,65 @@ def choose_work_and_source_roots(
     """
 
     target = Path(config.outdir)
+
+    if config.run_mode == "retry-ncbi-failures":
+
+        source = Path(config.source_refdb or config.outdir)
+        staging = recovery_staging_path(source)
+
+        backup = source.parent / (
+            f".{source.name}.FungiFunk_refdb_previous_backup"
+        )
+
+        # Never proceed while a previous replacement backup exists.
+        # The public reference may need manual inspection or restoration.
+        if backup.exists() or backup.is_symlink():
+            raise ConfigError(
+                "A previous safe-replacement backup exists:\n"
+                f"  {backup}\n\n"
+                "Inspect the backup and the original reference before "
+                "starting another manual NCBI recovery."
+            )
+
+        if not source.is_dir():
+            raise ConfigError(
+                "Manual NCBI recovery requires an existing completed "
+                f"reference directory: {source}"
+            )
+
+        # Recovery runs are never resumed. An existing staging path must
+        # be inspected and removed manually before starting another run.
+        if staging.exists() or staging.is_symlink():
+            raise ConfigError(
+                "A previous manual NCBI recovery staging path exists:\n"
+                f"  {staging}\n\n"
+                "Check that no recovery process is still running. "
+                "Inspect and remove the incomplete staging directory "
+                "manually before retrying."
+            )
+
+        # Validate the original reference before creating any working files.
+        verify_completed_reference(source)
+
+        # Exclusive directory creation also rejects a concurrent attempt
+        # that created the same staging path after our initial check.
+        try:
+            staging.mkdir()
+        except FileExistsError as exc:
+            raise ConfigError(
+                "Another manual NCBI recovery staging path already exists: "
+                f"{staging}"
+            ) from exc
+
+        initialize_output_layout(staging)
+
+        # Prepare an independent persistent state before any recovery work.
+        # A failed preparation leaves staging for explicit user inspection;
+        # the original completed reference is never modified.
+        prepare_manual_recovery_snapshot(source, staging)
+        prepare_manual_recovery_output_snapshot(source, staging)
+
+        return staging, source, source
 
     if config.run_mode == "overwrite-with-updated-version":
 
@@ -16230,6 +17149,198 @@ def pause_for_curation_fix(
 # Main orchestration
 ########################################################################################################
 
+def record_manual_ncbi_recovery_wrapper_action(action: str) -> None:
+    """Record the intended recovery action in the external wrapper log.
+
+    The wrapper uses this receipt only when Python exits successfully.
+    The log is outside the original reference during recovery.
+    """
+    if action not in {"PROMOTE", "NO_CHANGE"}:
+        raise DataIntegrityError(
+            f"Invalid manual recovery wrapper action: {action!r}"
+        )
+
+    log_path = os.environ.get("FUNGIFUNK_WRAPPER_RUN_INFO_LOG")
+
+    if not log_path:
+        return
+
+    with Path(log_path).open("a", encoding="utf-8") as handle:
+        handle.write(f"Manual_recovery_action: {action}\n")
+
+
+def report_manual_ncbi_recovery_remaining_failures(
+    state: StateDB,
+    source_root: Path,
+) -> None:
+    """Report unresolved NCBI failures and the exact manual retry command."""
+    import shlex
+
+    pending = pending_manual_ncbi_recovery_accessions(state)
+
+    if not pending:
+        info(
+            "Manual NCBI recovery: no unresolved eligible "
+            "NCBI retrieval failures remain."
+        )
+        return
+
+    affected_species = set(pending)
+
+    represented_species = {
+        int(row["species_taxid"])
+        for row in state.conn.execute(
+            """
+            SELECT DISTINCT species_taxid
+            FROM assemblies
+            WHERE selected=1
+              AND protein_fasta_available=1
+            """
+        )
+    }
+
+    represented_affected = affected_species & represented_species
+    unrepresented_affected = affected_species - represented_species
+
+    remaining_count = sum(
+        len(accessions)
+        for accessions in pending.values()
+    )
+
+    wrapper = Path(__file__).resolve().with_suffix(".sh")
+
+    retry_command = (
+        "bash "
+        + shlex.quote(str(wrapper))
+        + " --retry-ncbi-failures --source-refdb "
+        + shlex.quote(str(source_root))
+    )
+
+    warn(
+        "Manual NCBI recovery finished with unresolved retrieval failures.\n"
+        f"         Remaining assemblies: {remaining_count:,}\n"
+        f"         Affected species: {len(affected_species):,}\n"
+        f"         Still represented by usable assemblies: "
+        f"{len(represented_affected):,}\n"
+        f"         Without usable selected assemblies: "
+        f"{len(unrepresented_affected):,}\n"
+        "         These failures remain recorded for a later retry.\n"
+        "         To retry:\n"
+        f"         {retry_command}"
+    )
+
+
+def orchestrate_manual_ncbi_recovery(
+    config: BuildConfig,
+) -> tuple[Path, Path | None]:
+    """Recover NCBI failures without changing the original until promotion."""
+    work_root, source_root, destructive_target = (
+        choose_work_and_source_roots(config)
+    )
+
+    if (
+        source_root is None
+        or destructive_target is None
+        or source_root != destructive_target
+        or work_root != recovery_staging_path(source_root)
+    ):
+        raise DataIntegrityError(
+            "Manual NCBI recovery requires an isolated sibling staging "
+            "directory and the original completed reference as its target."
+        )
+
+    info(
+        "Manual NCBI recovery: working in isolated staging "
+        f"{work_root}"
+    )
+    info(f"Original completed reference: {source_root}")
+
+    # All mutations occur in the independent staging SQLite.
+    # Never open the source reference through StateDB.
+    with StateDB(work_root / STATE_DB_REL) as state:
+        if state.global_state() != "DONE":
+            raise DataIntegrityError(
+                "Manual NCBI recovery staging does not contain a "
+                "completed source-state snapshot."
+            )
+
+        result = run_manual_ncbi_recovery_processing(
+            state,
+            config,
+            work_root,
+            source_root,
+        )
+
+        if result.changed:
+            if result.resource_plan is None:
+                raise DataIntegrityError(
+                    "Manual NCBI recovery produced proteins without "
+                    "a finalization resource plan."
+                )
+
+            finalize_manual_ncbi_recovery_staging(
+                state,
+                work_root,
+                source_root,
+                config,
+                result.resource_plan,
+                explicit_targets=result.explicit_targets,
+            )
+
+        # Read-only warning: report remaining failures whether this pass
+        # recovered some assemblies or none.
+        report_manual_ncbi_recovery_remaining_failures(
+            state,
+            source_root,
+        )
+
+    # The SQLite connection is now closed. The original reference
+    # remains untouched until the final safe directory promotion.
+    if result.changed:
+        # Validate again after StateDB has closed and released its WAL.
+        verify_completed_reference(work_root)
+
+        print(flush=True)
+        print_section_banner("SAFE RECOVERY PROMOTION")
+
+        info(
+            "Recovered staging reference validated. "
+            "Publishing the completed recovery."
+        )
+
+        # Report the intended action before promotion. The wrapper trusts
+        # this receipt only if Python subsequently exits successfully.
+        record_manual_ncbi_recovery_wrapper_action("PROMOTE")
+
+        safe_replace_completed_directory(
+            work_root,
+            destructive_target,
+        )
+
+        info(
+            "Manual NCBI recovery complete: "
+            f"{result.recovered_count:,} assemblies recovered. "
+            f"Updated reference: {destructive_target}"
+        )
+
+        return destructive_target, destructive_target
+
+    # No proteins recovered: this is a successfully completed no-op,
+    # not an interrupted build. Remove only this run's staging.
+    # Unexpected errors above deliberately leave staging untouched.
+    record_manual_ncbi_recovery_wrapper_action("NO_CHANGE")
+
+    shutil.rmtree(work_root)
+    fsync_dir(work_root.parent)
+
+    info(
+        "Manual NCBI recovery completed without new proteins. "
+        "The original reference is unchanged and can be retried."
+    )
+
+    return source_root, None
+
+
 def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
 
     set_console_timestamps(
@@ -16274,6 +17385,19 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             )
 
     config = resolve_config(ns)
+
+    if config.run_mode == "retry-ncbi-failures":
+        if not config.db_version:
+            raise DataIntegrityError(
+                "Manual NCBI recovery must inherit the original "
+                "database version from the completed reference."
+            )
+
+        update_wrapper_run_info_db_version(
+            config.db_version
+        )
+
+        return orchestrate_manual_ncbi_recovery(config)
 
     if config.run_mode != "resume" and not config.db_version:
         config.db_version = default_db_version()
@@ -17570,9 +18694,15 @@ def main(
 
         # First show the composition of the reference that was actually built.
         try:
+            if getattr(ns, "retry_ncbi_failures", False):
+                print(flush=True)
+
             print_section_banner("SUMMARY")
             print_reference_build_summary(
-                final_root
+                final_root,
+                immutable_source=bool(
+                    getattr(ns, "retry_ncbi_failures", False)
+                ),
             )
             print(flush=True)
 
