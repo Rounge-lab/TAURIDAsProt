@@ -46,7 +46,7 @@ except ImportError:
 ########################################################################################################
 
 TOOL_NAME = "FungiFunk_refdb"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 FINAL_FASTA_NAME = "FungiFunk_protein_refdb.faa"
 
 ESTIMATED_RAM_GIB_PER_WORKER = 1.0
@@ -14377,8 +14377,151 @@ def write_protein_sources(
 
     # Announce completion only after the final file is in place.
     info(
-        f"Protein provenance complete: "
+        f"Protein provenance TSV complete: "
         f"{total_sources:,} source records."
+    )
+
+    # Export the same final provenance in grouped, compressed form.
+    write_grouped_protein_sources(state, work_root)
+
+
+def write_grouped_protein_sources(
+    state: StateDB,
+    work_root: Path,
+) -> None:
+    """Write grouped, compressed YAML provenance for the final reference."""
+    import gzip
+
+    path = work_root / METADATA_DIR / "fungal_protein_sources.yaml.gz"
+    part = path.with_name(path.name + ".part")
+
+    total_sources = int(
+        state.conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+    )
+
+    # JSON-quoted strings are valid YAML strings and safely preserve
+    # special characters in protein headers without requiring PyYAML.
+    def quote(value: Any) -> str:
+        return json.dumps(str(value), ensure_ascii=False)
+
+    rows = state.conn.execute(
+        """
+        SELECT *
+        FROM sources
+        ORDER BY
+            source_id,
+            species_taxid,
+            species,
+            assembly,
+            original_protein_accession,
+            original_header,
+            original_had_terminal_stop,
+            has_internal_stop,
+            num_internal_stops,
+            assembly_source,
+            paired_accession,
+            strain,
+            isolate,
+            tier,
+            id
+        """
+    )
+
+    previous_species = None
+    previous_assembly = None
+    previous_source = None
+    written = 0
+
+    with part.open("wb") as raw:
+        # A fixed gzip timestamp keeps identical exports reproducible.
+        with gzip.GzipFile(
+            fileobj=raw,
+            filename="",
+            mode="wb",
+            compresslevel=6,
+            mtime=0,
+        ) as archive:
+
+            def emit(text: str) -> None:
+                archive.write((text + "\n").encode("utf-8"))
+
+            emit("sources:" if total_sources else "sources: {}")
+
+            for r in rows:
+                source_key = r["source_id"]
+                species_key = (r["species_taxid"], r["species"])
+                assembly_key = r["assembly"]
+
+                # Each canonical sequence appears only once in the YAML.
+                if source_key != previous_source:
+                    emit(
+                        f"  {quote(source_key)}:\n"
+                        f"    Sequence_SHA256: "
+                        f"{quote(r['sequence_sha256'])}\n"
+                        f"    Sequence_length: "
+                        f"{int(r['sequence_length'])}\n"
+                        "    species:"
+                    )
+                    previous_source = source_key
+                    previous_species = None
+                    previous_assembly = None
+
+                # List every species sharing this protein sequence.
+                if species_key != previous_species:
+                    emit(
+                        f"      - Species: {quote(r['species'])}\n"
+                        f"        TaxID: {int(r['species_taxid'])}\n"
+                        "        assemblies:"
+                    )
+                    previous_species = species_key
+                    previous_assembly = None
+
+                # Keep the original protein records under their assembly.
+                if assembly_key != previous_assembly:
+                    emit(
+                        f"          - Assembly: {quote(assembly_key)}\n"
+                        "            original_protein_records:"
+                    )
+                    previous_assembly = assembly_key
+
+                emit(
+                    f"              - Tier: {int(r['tier'])}\n"
+                    f"                Assembly_source: "
+                    f"{quote(value_tsv(r['assembly_source']))}\n"
+                    f"                Paired_accession: "
+                    f"{quote(value_tsv(r['paired_accession']))}\n"
+                    f"                Strain: "
+                    f"{quote(value_tsv(r['strain']))}\n"
+                    f"                Isolate: "
+                    f"{quote(value_tsv(r['isolate']))}\n"
+                    f"                Original_protein_accession: "
+                    f"{quote(value_tsv(r['original_protein_accession']))}\n"
+                    f"                Original_header: "
+                    f"{quote(value_tsv(r['original_header']))}\n"
+                    f"                Original_had_terminal_stop: "
+                    f"{str(bool(r['original_had_terminal_stop'])).lower()}\n"
+                    f"                Has_internal_stop: "
+                    f"{str(bool(r['has_internal_stop'])).lower()}\n"
+                    f"                Num_internal_stops: "
+                    f"{int(r['num_internal_stops'])}"
+                )
+
+                written += 1
+
+        fsync_file(raw)
+
+    if written != total_sources:
+        part.unlink(missing_ok=True)
+        raise DataIntegrityError(
+            "Grouped protein provenance record count does not "
+            "match the final source inventory."
+        )
+
+    atomic_replace(part, path)
+
+    info(
+        f"Grouped protein provenance YAML complete: "
+        f"{written:,} source records."
     )
 
 
