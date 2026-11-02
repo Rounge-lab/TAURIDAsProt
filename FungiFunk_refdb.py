@@ -46,7 +46,7 @@ except ImportError:
 ########################################################################################################
 
 TOOL_NAME = "FungiFunk_refdb"
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 FINAL_FASTA_NAME = "FungiFunk_protein_refdb.faa"
 
 ESTIMATED_RAM_GIB_PER_WORKER = 1.0
@@ -7801,6 +7801,9 @@ class AssemblySelectionExecution:
 
     species_fallback_used: bool = False
 
+    # Number of assemblies accepted using proteins from the previous reference.
+    reused_assemblies: int = 0
+
 
 def execute_assembly_selection(
     assemblies: Sequence[AssemblyRecord],
@@ -7810,15 +7813,12 @@ def execute_assembly_selection(
 ) -> AssemblySelectionExecution:
     """Execute one deterministic assembly-selection policy.
 
-    `evaluate()` means different things in different contexts:
+    `evaluate()` checks whether an assembly has usable protein data.
 
-      CREATE:
-          attempt retrieval/validation of this assembly and return True only
-          when a usable protein FASTA was committed.
-
-      UPDATE FINALIZATION:
-          return True when this assembly is already known to be usable
-          (reusable or newly processed).
+    During CREATE, this may require downloading and validating proteins.
+    During UPDATE, unchanged assemblies can reuse verified proteins, while
+    new or changed assemblies are downloaded only when needed.
+    Final selection uses the protein availability already recorded in SQLite.
 
     Each accession is evaluated at most once. This is important when one
     assembly simultaneously represents a strain and one of its isolates.
@@ -9555,6 +9555,11 @@ class WorkerJob:
     worker_id: int = 0
     worker_total: int = 0
 
+    # UPDATE: assemblies whose protein data can be safely reused from
+    # the previous reference without another NCBI download.
+    # Empty for CREATE and recovery-only workers.
+    reusable_accessions: frozenset[str] = frozenset()
+
 
 @dataclass
 class WorkerResult:
@@ -9580,6 +9585,7 @@ class WorkerResult:
     represented_unassigned_groups: int | None = None
 
     species_fallback_used: bool = False
+    reused_assemblies: int = 0
 
 
 @dataclass
@@ -9714,6 +9720,10 @@ def build_ncbi_recovery_job(
         selection_policy=None,
         selection_constraints=None,
 
+        # Recovery retries actual NCBI failures only. Reusable assemblies
+        # must never be treated as recovery candidates.
+        reusable_accessions=frozenset(),
+
         # Keep partial recovery products separate from the normal species-ready
         # checkpoint so they can never overwrite the first-pass result.
         temp_base=str(recovery_temp_base),
@@ -9806,6 +9816,7 @@ def validate_species_products(fasta_path: Path, sqlite_path: Path, expected_asse
             "COMMITTED",
             "FAILED",
             "NOT_SELECTED",
+            "REUSABLE",
         }
 
         for accession, row in result_rows.items():
@@ -9837,6 +9848,24 @@ def validate_species_products(fasta_path: Path, sqlite_path: Path, expected_asse
                     raise DataIntegrityError(
                         "Failed assembly result has inconsistent protein "
                         f"metadata: {accession}"
+                    )
+
+            elif status == "REUSABLE":
+                # Reusable protein sources remain in the previous reference.
+                # The UPDATE state already contains their verified availability
+                # metadata; this worker checkpoint only records the reuse decision.
+                if any(
+                    row[field] is not None
+                    for field in (
+                        "protein_fasta_available",
+                        "protein_count",
+                        "protein_fasta_sha256",
+                        "ncbi_protein_md5",
+                    )
+                ):
+                    raise DataIntegrityError(
+                        "Reusable assembly checkpoint unexpectedly contains "
+                        f"protein metadata: {accession}"
                     )
 
             else:  # NOT_SELECTED
@@ -10562,11 +10591,9 @@ def process_species_worker(job: WorkerJob) -> WorkerResult:
 
             if job.selection_policy is None:
 
-                # Update mode: process the complete new/changed delta.
-                #
-                # No biological depth cap is applied here because final
-                # selection must later consider these candidates together
-                # with unchanged reusable assemblies.
+                # NCBI recovery retries assemblies that failed earlier.
+                # Biological selection is applied again after recovery,
+                # so the retry worker processes every requested assembly.
                 for assembly in job.assemblies:
                     evaluate_candidate(
                         assembly
@@ -10574,12 +10601,46 @@ def process_species_worker(job: WorkerJob) -> WorkerResult:
 
             else:
 
-                # Fresh create: protein availability becomes known lazily while
-                # the deterministic biological selection policy is executed.
+                # CREATE and UPDATE use the same biological selection policy.
+                # UPDATE can also accept assemblies whose proteins were
+                # already verified for reuse, without downloading them again.
+                def evaluate_for_selection(
+                    assembly: AssemblyRecord,
+                ) -> bool:
+
+                    if assembly.accession not in job.reusable_accessions:
+                        return evaluate_candidate(assembly)
+
+                    # This assembly already has usable proteins in the
+                    # previous reference. Record the reuse decision without
+                    # copying its proteins into the worker files.
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO assembly_results
+                        VALUES(?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            assembly.accession,
+                            "REUSABLE",
+                            "UNCHANGED_SOURCE",
+                            None,
+                            None,
+                            None,
+                            None,
+                            "Proteins available for reuse from the previous reference.",
+                        ),
+                    )
+
+                    # Keep the reuse decision committed before another
+                    # candidate starts its own SQLite transaction.
+                    conn.commit()
+
+                    return True
+
                 resolution = execute_assembly_selection(
                     job.assemblies,
                     job.selection_policy,
-                    evaluate_candidate,
+                    evaluate_for_selection,
                     constraints=job.selection_constraints,
                 )
 
@@ -10632,6 +10693,20 @@ def process_species_worker(job: WorkerJob) -> WorkerResult:
             fsync_file(fasta_out)
 
         conn.commit()
+
+        # Count only assemblies that the selection actually reused.
+        # Other reusable candidates may have been skipped after filling
+        # the biological selection quota.
+        reused_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM assembly_results
+                WHERE status='REUSABLE'
+                """
+            ).fetchone()[0]
+        )
+
         conn.close()
 
         expected = [
@@ -10675,6 +10750,7 @@ def process_species_worker(job: WorkerJob) -> WorkerResult:
             total_source_occurrences=source_count,
             attempted_assemblies=attempted,
             failure_reasons=failure_reasons,
+            reused_assemblies=reused_count,
             retryable_ncbi_failures=(
                 retryable_ncbi_failures
             ),
@@ -10828,11 +10904,43 @@ def import_species_worker_result(
                                protein_fasta_available=1,protein_count=?,protein_fasta_sha256=?,ncbi_package_md5=? WHERE accession=?""",
                         (row["protein_count"],row["protein_fasta_sha256"],row["ncbi_protein_md5"],accession),
                     )
+                elif status == "REUSABLE":
+                    # Only assemblies previously verified by UPDATE may be
+                    # reused. Their protein sources are imported later,
+                    # after the final biological selection.
+                    existing = state.conn.execute(
+                        """
+                        SELECT update_change, update_reason,
+                               protein_fasta_available, protein_count
+                        FROM assemblies
+                        WHERE accession=? AND species_taxid=?
+                        """,
+                        (accession, result.species_taxid),
+                    ).fetchone()
+
+                    if (
+                        existing is None
+                        or existing["update_change"] != "KEPT"
+                        or existing["update_reason"] != "UNCHANGED"
+                        or existing["protein_fasta_available"] != 1
+                        or existing["protein_count"] is None
+                        or int(existing["protein_count"]) <= 0
+                    ):
+                        raise DataIntegrityError(
+                            "Worker reported an assembly as reusable without "
+                            "a verified UPDATE reuse classification: "
+                            f"{accession}"
+                        )
+
+                    # Preserve the availability metadata from classify_update().
+                    # Final assembly selection and source import happen later.
+
                 elif status == "NOT_SELECTED":
                     state.conn.execute(
                         "UPDATE assemblies SET selected=0,final_status='NOT_SELECTED',final_reason=? WHERE accession=?",
                         (row["reason"],accession),
                     )
+
                 else:
                     state.conn.execute(
                         """UPDATE assemblies SET selected=0,final_status='EXCLUDED',final_reason=?,
@@ -11149,11 +11257,11 @@ def worker_representation_summary_parts(
     job: WorkerJob,
     result: WorkerResult,
 ) -> list[str]:
-    """Return final representation coverage for one CREATE worker.
+    """Summarize biological representation after a worker's first pass.
 
-    Update workers intentionally return no representation summary here because
-    their final biological selection is resolved later using reusable and newly
-    processed assemblies together.
+    CREATE and UPDATE use the same selection rules during processing.
+    UPDATE may change its final selection after NCBI recovery.
+    Recovery workers do not calculate this summary.
     """
 
     policy = job.selection_policy
@@ -11172,7 +11280,7 @@ def worker_representation_summary_parts(
 
     if any(value is None for value in required):
         raise DataIntegrityError(
-            "CREATE worker result is missing representation coverage metrics."
+            "Worker result is missing representation coverage metrics."
         )
 
     return representation_summary_parts(
@@ -11264,6 +11372,8 @@ def worker_finished_block(
     unique: int,
     representation_parts: list[str] | None = None,
     failure_reasons: Mapping[str, int] | None = None,
+    update_mode: bool = False,
+    reused: int = 0,
 ) -> None:
     """Print one complete multi-line species completion block."""
 
@@ -11283,14 +11393,29 @@ def worker_finished_block(
             )
         )
 
-    lines.extend(
-        [
-            f"{continuation}Assemblies attempted: {attempted:,}",
-            f"{continuation}Accepted:  {accepted:,}",
-            f"{continuation}Proteins:  {proteins:,}",
-            f"{continuation}Unique:    {unique:,}",
-        ]
-    )
+    if update_mode:
+        # UPDATE shows reused assemblies separately from newly processed ones.
+        # Protein counts here include only new worker output.
+        lines.extend(
+            [
+                f"{continuation}Assemblies attempted: {attempted:,}",
+                f"{continuation}Newly processed: {accepted:,}",
+                f"{continuation}Reused: {reused:,}",
+                f"{continuation}New protein records: {proteins:,}",
+                f"{continuation}New unique sequences: {unique:,}",
+            ]
+        )
+
+    else:
+        # Keep the existing CREATE and NCBI recovery output unchanged.
+        lines.extend(
+            [
+                f"{continuation}Assemblies attempted: {attempted:,}",
+                f"{continuation}Accepted:  {accepted:,}",
+                f"{continuation}Proteins:  {proteins:,}",
+                f"{continuation}Unique:    {unique:,}",
+            ]
+        )
 
     if failure_reasons:
         lines.append(f"{continuation}Failures:")
@@ -12114,16 +12239,14 @@ def run_species_workers(
     work_root: Path,
     resource_plan: ResourcePlan,
     *,
-    selection_constraints_by_species: Mapping[
-        int,
-        AssemblySelectionConstraints,
-    ] | None = None,
+    selection_constraints_by_species: Mapping[int, AssemblySelectionConstraints] | None = None,
+    reusable_accessions_by_species: Mapping[int, set[str]] | None = None,
     update_mode: bool = False,
     recovery_only: bool = False,
 ) -> dict[int, NCBIRecoverySummary]:
     if recovery_only and update_mode:
         raise DataIntegrityError(
-            "Manual NCBI recovery cannot run as an ordinary update delta."
+            "Manual NCBI recovery cannot run with update_mode=True."
         )
 
     pending_manual = (
@@ -12207,18 +12330,10 @@ def run_species_workers(
         exist_ok=True,
     )
 
-    # Fresh builds can apply the complete biological selection policy while
-    # candidates are processed, avoiding unnecessary downloads once a selection
-    # role has been filled.
-    #
-    # Update workers deliberately process the complete new/changed delta instead.
-    # Final selection must wait until those candidates can be considered together
-    # with safely reusable assemblies from the previous reference.
-    worker_selection_policy = (
-        None
-        if update_mode
-        else assembly_selection_policy(config)
-    )
+    # CREATE and UPDATE use the same biological selection policy while
+    # processing candidates. UPDATE can also reuse unchanged assemblies
+    # without downloading their proteins again.
+    worker_selection_policy = assembly_selection_policy(config)
 
     worker_selection_constraints = (
         selection_constraints_by_species
@@ -12245,21 +12360,23 @@ def run_species_workers(
             species=species,
             assemblies=assemblies,
 
-            # Fresh builds select dynamically while protein usability becomes
-            # known. Update workers resolve availability for the complete delta
-            # and defer biological selection until reusable and processed
-            # candidates can be evaluated together.
-            selection_policy=(
-                worker_selection_policy
-            ),
+            # Both CREATE and UPDATE select assemblies progressively using
+            # the same biological rules and explicit target constraints.
+            selection_policy=worker_selection_policy,
 
             selection_constraints=(
-                None
-                if update_mode
-                else worker_selection_constraints.get(
+                worker_selection_constraints.get(
                     taxid,
                     AssemblySelectionConstraints(),
                 )
+            ),
+
+            # UPDATE can accept these assemblies without downloading them.
+            # CREATE has no reusable assemblies.
+            reusable_accessions=frozenset(
+                reusable_accessions_by_species.get(taxid, set())
+                if reusable_accessions_by_species is not None
+                else ()
             ),
 
             temp_base=str(
@@ -12416,8 +12533,8 @@ def run_species_workers(
         not jobs
         and not recovery_jobs
     ):
-        # An update may have no new candidates, or all species may already have
-        # committed processing/recovery checkpoints.
+        # No workers are needed when there are no eligible species left
+        # to process or all required checkpoints are already complete.
         if update_mode:
             info(
                 "Species processing: 0 species queued; no protein worker "
@@ -12520,7 +12637,10 @@ def run_species_workers(
                 completed_species += 1
 
                 if config.verbose:
-                    if result.successful_assemblies > 0:
+                    if (
+                        result.successful_assemblies > 0
+                        or (update_mode and result.reused_assemblies > 0)
+                    ):
                         worker_finished_block(
                             job,
                             level="INFO",
@@ -12532,6 +12652,8 @@ def run_species_workers(
                                 job,
                                 result,
                             ),
+                            update_mode=update_mode,
+                            reused=result.reused_assemblies,
                         )
 
                     else:
@@ -12547,6 +12669,8 @@ def run_species_workers(
                                 job,
                                 result,
                             ),
+                            update_mode=update_mode,
+                            reused=result.reused_assemblies,
                         )
 
                 else:
@@ -12568,41 +12692,59 @@ def run_species_workers(
                         else ""
                     )
 
-                    if result.successful_assemblies > 0:
-                        status = "PROCESSED" if update_mode else "INCLUDED"
+                    if (
+                        result.successful_assemblies > 0
+                        or (update_mode and result.reused_assemblies > 0)
+                    ):
+                        if update_mode:
+                            # UPDATE reports new processing and reuse separately.
+                            # The final selected assemblies are reported after
+                            # automatic NCBI recovery and final selection.
+                            info(
+                                f"Species {completed_species:>{progress_width}}/{worker_total} "
+                                f"{'EVALUATED':<12}: {result.species}"
+                                f"{representation_line}\n"
+                                f"       Assemblies attempted={result.attempted_assemblies} | "
+                                f"Newly processed={result.successful_assemblies} | "
+                                f"Reused={result.reused_assemblies} | "
+                                f"New protein records={result.total_source_occurrences:,} | "
+                                f"New unique sequences={result.unique_sequences:,}"
+                            )
 
-                        success_label = (
-                            "With usable proteins"
-                            if update_mode
-                            else "Accepted"
-                        )
-
-                        assemblies_label = (
-                            "Assemblies with usable proteins"
-                            if update_mode
-                            else "Assemblies included"
-                        )
-
-                        info(
-                            f"Species {completed_species:>{progress_width}}/{worker_total} "
-                            f"{status:<12}: "
-                            f"{result.species}"
-                            f"{representation_line}\n"
-                            f"       Assemblies attempted={result.attempted_assemblies} | "
-                            f"{success_label}={result.successful_assemblies} | "
-                            f"Proteins={result.total_source_occurrences:,} | "
-                            f"Unique={result.unique_sequences:,}\n"
-                            f"       {assemblies_label} ({len(selected_accessions)}): "
-                            f"{', '.join(selected_accessions)}"
-                        )
+                        else:
+                            info(
+                                f"Species {completed_species:>{progress_width}}/{worker_total} "
+                                f"{'INCLUDED':<12}: {result.species}"
+                                f"{representation_line}\n"
+                                f"       Assemblies attempted={result.attempted_assemblies} | "
+                                f"Accepted={result.successful_assemblies} | "
+                                f"Proteins={result.total_source_occurrences:,} | "
+                                f"Unique={result.unique_sequences:,}\n"
+                                f"       Assemblies included ({len(selected_accessions)}): "
+                                f"{', '.join(selected_accessions)}"
+                            )
 
                     else:
-                        status = "PROCESSED" if update_mode else "NOT INCLUDED"
+                        status = "EVALUATED" if update_mode else "NOT INCLUDED"
 
                         success_label = (
-                            "With usable proteins"
+                            "Newly processed"
                             if update_mode
                             else "Accepted"
+                        )
+
+                        reused_fragment = " | Reused=0" if update_mode else ""
+
+                        protein_label = (
+                            "New protein records"
+                            if update_mode
+                            else "Proteins"
+                        )
+
+                        unique_label = (
+                            "New unique sequences"
+                            if update_mode
+                            else "Unique"
                         )
 
                         failure_summary = " | ".join(
@@ -12616,9 +12758,9 @@ def run_species_workers(
                             f"{result.species}"
                             f"{representation_line}\n"
                             f"       Assemblies attempted={result.attempted_assemblies} | "
-                            f"{success_label}=0 | "
-                            f"Proteins=0 | "
-                            f"Unique=0"
+                            f"{success_label}=0{reused_fragment} | "
+                            f"{protein_label}=0 | "
+                            f"{unique_label}=0"
                         )
 
                         if failure_summary:
@@ -17831,7 +17973,12 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                     "metadata filters"
                 )
 
-            if len(curation_inputs) == 1:
+            if not curation_inputs:
+                curation_input_text = (
+                    "the biological configuration inherited "
+                    "from the source reference"
+                )
+            elif len(curation_inputs) == 1:
                 curation_input_text = curation_inputs[0]
             elif len(curation_inputs) == 2:
                 curation_input_text = (
@@ -18301,34 +18448,33 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                 # Announce protein processing before its introductory message.
                 state.set_global_state("PROTEIN_RETRIEVAL_AND_PROCESSING")
 
-                # Explain whether the comparison found protein data that
-                # actually needs to be retrieved and processed.
-                if delta_total:
-                    info(
-                        "Starting protein processing for assemblies that require new "
-                        "protein data."
-                    )
-                    info(
-                        f"New/changed assembly candidates: {delta_total:,}; "
-                        f"species affected: {species_with_delta:,}."
-                    )
-                else:
-                    info(
-                        "No new or changed assembly candidates require protein "
-                        "retrieval or processing."
-                    )
-                    info(
-                        "The update can continue using the reusable candidates "
-                        "identified by the comparison."
-                    )
+                # UPDATE evaluates all eligible candidates using the same
+                # biological selection rules as CREATE. Unchanged assemblies
+                # can reuse their existing proteins without another download.
+                info(
+                    "Evaluating assembly candidates. "
+                    "Unchanged assemblies will reuse their existing proteins, "
+                    "and new downloads will be attempted only when needed."
+                )
+
+                info(
+                    f"Eligible candidates: {eligible_assemblies:,} | "
+                    f"Reusable: {reusable_total:,} | "
+                    f"New/changed: {delta_total:,} "
+                    f"across {species_with_delta:,} species."
+                )
 
                 recovery_summaries = run_species_workers(
                     state,
                     species_map,
-                    delta_pools,
+                    full_pools,
                     config,
                     work_root,
                     plan,
+                    selection_constraints_by_species=(
+                        selection_constraints_by_species
+                    ),
+                    reusable_accessions_by_species=reusable,
                     update_mode=True,
                 )
 
