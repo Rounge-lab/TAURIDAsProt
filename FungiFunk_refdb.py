@@ -46,7 +46,7 @@ except ImportError:
 ########################################################################################################
 
 TOOL_NAME = "FungiFunk_refdb"
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 FINAL_FASTA_NAME = "FungiFunk_protein_refdb.faa"
 
 ESTIMATED_RAM_GIB_PER_WORKER = 1.0
@@ -13066,10 +13066,6 @@ def run_manual_ncbi_recovery_processing(
     pending = pending_manual_ncbi_recovery_accessions(state)
 
     if not pending:
-        info(
-            "Manual NCBI recovery: no unresolved eligible NCBI "
-            "retrieval failures remain."
-        )
         return ManualNCBIRecoveryResult(
             recovered_count=0,
             resource_plan=None,
@@ -19025,11 +19021,6 @@ def main(
         )
 
         info(
-            f"  Protein provenance: "
-            f"{final_root / METADATA_DIR / 'fungal_protein_sources.tsv'}"
-        )
-
-        info(
             f"  Reproduction targets: "
             f"{final_root / METADATA_DIR / REPRODUCTION_TARGETS_TSV}"
         )
@@ -19038,6 +19029,52 @@ def main(
             f"  Build summary: "
             f"{final_root / REPORTS_DIR / 'build_summary.tsv'}"
         )
+
+        info(
+            f"  Protein provenance TSV: "
+            f"{final_root / METADATA_DIR / 'fungal_protein_sources.tsv'}"
+        )
+
+        info(
+            f"  Protein provenance YAML: "
+            f"{final_root / METADATA_DIR / 'fungal_protein_sources.yaml.gz'}"
+        )
+
+        # The shell wrapper finalizes the console log after Python exits.
+        console_log_name = os.environ.get("FUNGIFUNK_CONSOLE_LOG_NAME")
+
+        if console_log_name:
+            console_log_path = final_root / LOGS_DIR / console_log_name
+
+            # Manual NCBI recovery without changes keeps its log outside
+            # the original reference, which must remain untouched.
+            if getattr(ns, "retry_ncbi_failures", False):
+                wrapper_log = os.environ.get(
+                    "FUNGIFUNK_WRAPPER_RUN_INFO_LOG"
+                )
+
+                if wrapper_log:
+                    try:
+                        with Path(wrapper_log).open(
+                            "r", encoding="utf-8"
+                        ) as handle:
+                            no_change = any(
+                                line.strip() == "Manual_recovery_action: NO_CHANGE"
+                                for line in handle
+                            )
+                    except OSError:
+                        no_change = False
+
+                    if no_change:
+                        console_log_path = (
+                            final_root.parent
+                            / (
+                                f".{final_root.name}.FungiFunk_refdb_"
+                                f"{console_log_name}"
+                            )
+                        )
+
+            info(f"  Console log: {console_log_path}")
 
         return EXIT_OK
 

@@ -13,7 +13,7 @@ TEMPLATE_DIR="${script_dir}/FungiFunk_refdb_templates"
 
 # Define the name, version and final output file of the tool
 TOOL_NAME="FungiFunk_refdb"
-VERSION="0.4.1"
+VERSION="0.4.2"
 FINAL_FASTA_NAME="FungiFunk_protein_refdb.faa"
 
 # Internal paths used by FungiFunk_refdb
@@ -2043,6 +2043,102 @@ EOF
 
 
 ########################################################################################################
+# Capture standard output
+########################################################################################################
+CONSOLE_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
+CONSOLE_LOG_NAME="console_${CONSOLE_RUN_ID}.log"
+CONSOLE_PART="$(dirname -- "$run_info_log")/.${CONSOLE_LOG_NAME}.part"
+
+finish_console_capture() {
+    local run_status=$?
+    trap - EXIT INT TERM
+
+    # Restore the terminal and finish writing the captured output.
+    exec 1>&3 2>&4
+    exec 3>&- 4>&-
+
+    if ! wait "$CONSOLE_TEE_PID"; then
+        printf '[WARNING] Console capture ended unexpectedly.\n' >&2
+    fi
+
+    local source_path="$CONSOLE_PART"
+    local target_dir="${OUTDIR_CANON}/logs"
+    local target_name="$CONSOLE_LOG_NAME"
+
+    if [[ "$RUN_MODE" == "overwrite-with-updated-version" ||
+          "$RUN_MODE" == "retry-ncbi-failures" ]]; then
+
+        local parent_dir
+        local reference_name
+        local staging_dir
+
+        parent_dir="$(dirname -- "$OUTDIR_CANON")"
+        reference_name="$(basename -- "$OUTDIR_CANON")"
+
+        if [[ "$RUN_MODE" == "retry-ncbi-failures" ]]; then
+            staging_dir="${parent_dir}/.${reference_name}.FungiFunk_refdb_recovery_staging"
+        else
+            staging_dir="${parent_dir}/.${reference_name}.FungiFunk_refdb_update_staging"
+        fi
+
+        if [[ "$run_status" -eq 0 &&
+              "${RECOVERY_ACTION:-}" != "NO_CHANGE" ]]; then
+            target_dir="${OUTDIR_CANON}/logs"
+
+        elif [[ "$run_status" -ne 0 && -d "$staging_dir" ]]; then
+            target_dir="${staging_dir}/logs"
+
+        else
+            # Keep failed or no-change logs outside the original reference.
+            target_dir="$parent_dir"
+            target_name=".${reference_name}.FungiFunk_refdb_${CONSOLE_LOG_NAME}"
+        fi
+
+    elif [[ "$RUN_MODE" == "resume" &&
+            "${RESUMING_OVERWRITE:-false}" == "true" &&
+            ! -d "$OUTDIR_CANON" &&
+            -d "${RESUMED_OVERWRITE_TARGET:-}" ]]; then
+
+        # A successful resumed overwrite moves the staging directory.
+        target_dir="${RESUMED_OVERWRITE_TARGET}/logs"
+        source_path="${target_dir}/.${CONSOLE_LOG_NAME}.part"
+    fi
+
+    local final_path="${target_dir}/${target_name}"
+
+    if mkdir -p -- "$target_dir" &&
+       mv -- "$source_path" "$final_path"; then
+        printf '[INFO] Console log: %s\n' "$final_path" |
+            tee -a "$final_path"
+    else
+        printf '[WARNING] Could not finalize console log: %s\n' \
+            "$source_path" >&2
+    fi
+}
+
+# Use a named pipe so the logging process can be waited for safely.
+# Keep the logging process alive when the user presses Ctrl+C.
+CONSOLE_PIPE="${CONSOLE_PART}.pipe"
+mkfifo -- "$CONSOLE_PIPE"
+
+exec 3>&1 4>&2
+
+(
+    trap '' INT TERM
+    tee "$CONSOLE_PART" < "$CONSOLE_PIPE" >&3
+) &
+CONSOLE_TEE_PID=$!
+
+exec > "$CONSOLE_PIPE" 2>&1
+
+rm -f -- "$CONSOLE_PIPE"
+
+trap 'finish_console_capture' EXIT
+trap 'log_msg "[WARNING] Run interrupted by user (Ctrl+C)."; exit 130' INT
+trap 'log_msg "[WARNING] Run terminated (SIGTERM)."; exit 143' TERM
+
+
+########################################################################################################
 # Print run start messages
 ########################################################################################################
 echo "###################################################################################################"
@@ -2088,7 +2184,8 @@ echo ""
 set +e
 
 FUNGIFUNK_WRAPPER_RUN_INFO_LOG="$run_info_log" \
-    python3 "$PYTHON_SCRIPT" "${ORIGINAL_ARGS[@]}"
+FUNGIFUNK_CONSOLE_LOG_NAME="$CONSOLE_LOG_NAME" \
+    PYTHONUNBUFFERED=1 python3 "$PYTHON_SCRIPT" "${ORIGINAL_ARGS[@]}"
 
 PYTHON_STATUS=$?
 set -e
