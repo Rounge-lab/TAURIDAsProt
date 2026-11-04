@@ -13,7 +13,7 @@ TEMPLATE_DIR="${script_dir}/FungiFunk_refdb_templates"
 
 # Define the name, version and final output file of the tool
 TOOL_NAME="FungiFunk_refdb"
-VERSION="0.4.2"
+VERSION="0.5.0"
 FINAL_FASTA_NAME="FungiFunk_protein_refdb.faa"
 
 # Internal paths used by FungiFunk_refdb

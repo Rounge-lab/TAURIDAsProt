@@ -28,7 +28,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 try:
     import psutil  # type: ignore
@@ -46,7 +46,7 @@ except ImportError:
 ########################################################################################################
 
 TOOL_NAME = "FungiFunk_refdb"
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 FINAL_FASTA_NAME = "FungiFunk_protein_refdb.faa"
 
 ESTIMATED_RAM_GIB_PER_WORKER = 1.0
@@ -2502,6 +2502,11 @@ CREATE TABLE IF NOT EXISTS assemblies (
 CREATE INDEX IF NOT EXISTS idx_assemblies_species ON assemblies(species_taxid);
 CREATE INDEX IF NOT EXISTS idx_assemblies_selected ON assemblies(selected);
 
+CREATE TABLE IF NOT EXISTS assembly_inventory_completed (
+    species_taxid INTEGER PRIMARY KEY,
+    FOREIGN KEY(species_taxid) REFERENCES species(taxid)
+);
+
 CREATE TABLE IF NOT EXISTS assembly_failures (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     accession TEXT,
@@ -2701,6 +2706,7 @@ class StateDB:
         """Safe only before assembly processing; used after curation fix."""
         with self.conn:
             for table in [
+                "assembly_inventory_completed",
                 "species", "assemblies", "assembly_failures", "species_filter_failures",
                 "protein_warnings", "failed_downloads", "sources", "canonical_sequences",
                 "update_changes",
@@ -8872,12 +8878,48 @@ def build_assembly_inventory(
 
     by_species: dict[int, list[AssemblyRecord]] = {}
 
+    completed_taxids = {
+        int(row["species_taxid"])
+        for row in state.conn.execute(
+            "SELECT species_taxid FROM assembly_inventory_completed"
+        )
+    }
+
+    unexpected_taxids = completed_taxids.difference(species_map)
+
+    if unexpected_taxids:
+        raise DataIntegrityError(
+            "Assembly inventory checkpoints reference species outside "
+            "the retained species set: "
+            + ", ".join(str(taxid) for taxid in sorted(unexpected_taxids))
+        )
+
+    if completed_taxids:
+        info(
+            f"Resume: {len(completed_taxids)}/{len(species_map)} "
+            "species assembly inventories already completed."
+        )
+
     sorted_species = sorted(
         species_map.values(),
         key=lambda x: (x.species, x.taxid),
     )
 
     for i, species in enumerate(sorted_species, start=1):
+
+        if species.taxid in completed_taxids:
+            info(
+                f"Resume: reusing assembly inventory for species "
+                f"{i}/{len(sorted_species)}: "
+                f"{species.species} (TaxID {species.taxid})"
+            )
+
+            by_species[species.taxid] = load_assembly_pool_from_state(
+                state,
+                [species.taxid],
+            )[species.taxid]
+
+            continue
 
         # This per-species progress line remains visible in normal output.
         # Detailed assembly-by-assembly decisions are shown only with --verbose.
@@ -8940,6 +8982,17 @@ def build_assembly_inventory(
         explicit_target_rejections: list[str] = []
 
         with state.conn:
+
+            # Remove leftover rows before rebuilding an incomplete species.
+            state.conn.execute(
+                "DELETE FROM assembly_failures WHERE species_taxid=?",
+                (species.taxid,),
+            )
+
+            state.conn.execute(
+                "DELETE FROM assemblies WHERE species_taxid=?",
+                (species.taxid,),
+            )
 
             for assembly_number, a in enumerate(records, start=1):
 
@@ -9201,18 +9254,27 @@ def build_assembly_inventory(
                         ],
                     )
 
-        if explicit_target_rejections:
+            if explicit_target_rejections:
 
-            raise ConfigError(
-                "One or more explicitly included assembly targets failed "
-                "mandatory assembly eligibility checks. Explicit targets may "
-                "override automatic GCA source-scope policy, but they do not "
-                "bypass hard assembly QC or active assembly metadata filters.\n"
-                + "\n".join(
-                    f"  - {detail}"
-                    for detail
-                    in explicit_target_rejections
+                raise ConfigError(
+                    "One or more explicitly included assembly targets failed "
+                    "mandatory assembly eligibility checks. Explicit targets may "
+                    "override automatic GCA source-scope policy, but they do not "
+                    "bypass hard assembly QC or active assembly metadata filters.\n"
+                    + "\n".join(
+                        f"  - {detail}"
+                        for detail
+                        in explicit_target_rejections
+                    )
                 )
+
+            # Commit the species inventory and checkpoint together.
+            state.conn.execute(
+                """
+                INSERT INTO assembly_inventory_completed(species_taxid)
+                VALUES(?)
+                """,
+                (species.taxid,),
             )
 
         # Protein FASTA availability is only known after downloading an assembly.
@@ -10798,7 +10860,7 @@ def process_species_worker(job: WorkerJob) -> WorkerResult:
     finally:
         try:
             conn.close()
-        except Exception:
+        except Exception:  # noqa: S110
             pass
 
         shutil.rmtree(
@@ -11638,10 +11700,14 @@ def calculate_resource_plan(config: BuildConfig, work_root: Path, temp_base: Pat
     output_workers = max(0, int(output_usable // int(ESTIMATED_TMP_GIB_PER_WORKER * 1024 ** 3)))
     safe = min(cpu, ram_workers, temp_workers, output_workers)
     limiting: list[str] = []
-    if safe == cpu: limiting.append("CPU")
-    if safe == ram_workers: limiting.append("RAM")
-    if safe == temp_workers: limiting.append("TEMP_DISK")
-    if safe == output_workers: limiting.append("OUTPUT_DISK")
+    if safe == cpu:
+        limiting.append("CPU")
+    if safe == ram_workers:
+        limiting.append("RAM")
+    if safe == temp_workers:
+        limiting.append("TEMP_DISK")
+    if safe == output_workers:
+        limiting.append("OUTPUT_DISK")
     if safe < 1:
         raise ResourceSafetyError(
             "Resource estimator cannot safely allocate even one worker with the current heuristics. "
@@ -13366,7 +13432,7 @@ def finalize_create_selection(
             policy,
             lambda assembly: (
                 assembly.accession
-                in usable_accessions
+                in usable_accessions  # noqa: B023
             ),
             constraints=(
                 active_constraints_by_species.get(
@@ -13704,7 +13770,7 @@ def finalize_update_selection(
             policy,
             lambda assembly: (
                 assembly.accession
-                in usable_accessions
+                in usable_accessions  # noqa: B023
             ),
             constraints=(
                 active_constraints_by_species.get(
@@ -16763,6 +16829,7 @@ def print_reference_build_summary(
 def clear_inventory_for_safe_rebuild(state: StateDB) -> None:
     """Discard a partially built inventory before any protein processing began."""
     with state.conn:
+        state.conn.execute("DELETE FROM assembly_inventory_completed")
         state.conn.execute("DELETE FROM assembly_failures")
         state.conn.execute("DELETE FROM failed_downloads")
         state.conn.execute("DELETE FROM assemblies")
@@ -17705,12 +17772,10 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
     with StateDB(state_path) as state:
 
         resume_biological_options: list[str] = []
-        resume_original_state: str | None = None
 
         if config.run_mode == "resume":
 
             current_state = state.global_state()
-            resume_original_state = current_state
 
             completion_marker = work_root / COMPLETION_MARKER_REL
 
@@ -18334,10 +18399,19 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             )
 
         else:
-            # If an inventory query crashed midway, no protein processing has
-            # started yet. Rebuilding the inventory from scratch avoids ambiguous
-            # partial per-species inventories and duplicate failure rows.
-            if assembly_count:
+            completed_species_count = int(
+                state.conn.execute(
+                    "SELECT COUNT(*) FROM assembly_inventory_completed"
+                ).fetchone()[0]
+            )
+
+            # Legacy interrupted builds have no per-species checkpoints.
+            # Rebuild their partial inventory once for safe migration.
+            legacy_inventory_cleared = (
+                assembly_count > 0 and completed_species_count == 0
+            )
+
+            if legacy_inventory_cleared:
                 clear_inventory_for_safe_rebuild(state)
 
             state.set_global_state("ASSEMBLY_SEARCH_AND_SELECTION")
@@ -18345,6 +18419,12 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             info(
                 "Preparing genome assembly candidates for the retained species."
             )
+
+            if legacy_inventory_cleared:
+                info(
+                    "Legacy partial assembly inventory detected: "
+                    "previous inventory cleared for safe rebuilding."
+                )
 
             full_pools = build_assembly_inventory(
                 state,
