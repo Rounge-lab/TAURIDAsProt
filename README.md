@@ -8,7 +8,7 @@ It allows users to choose which organisms and assemblies to include, retrieve th
 
 The tool also supports resuming interrupted runs, updating existing databases, and retrying failed NCBI downloads without rebuilding the entire reference.
 
-**Current version:** v0.3.1  
+**Current version:** v0.5.0  
 **Status:** Active development
 
 > **A note on the name:** FungiFunk_refdb was originally developed as part of the FungiFunk project. Despite its current name, the tool is not limited to fungi and can be used with other taxa. A future name change is planned to better reflect its broader scope.
