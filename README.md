@@ -1,6 +1,6 @@
 # TAURIDAsProt
 
-** <ins>T</ins>axon-guided <ins>A</ins>ssembly and <ins>U</ins>pdating of <ins>R</ins>eference databases through <ins>I</ins>dentity-based <ins>D</ins>eduplication of protein sequences derived from genome <ins>A</ins><ins>s</ins>semblies**
+**<ins>T</ins>axon-guided <ins>A</ins>ssembly and <ins>U</ins>pdating of <ins>R</ins>eference databases through <ins>I</ins>dentity-based <ins>D</ins>eduplication of protein sequences derived from genome <ins>A</ins><ins>s</ins>semblies**
 
 TAURIDAsProt is a command-line tool for building and maintaining protein reference databases using genome assemblies from NCBI Datasets.
 
