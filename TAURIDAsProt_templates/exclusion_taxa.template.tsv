@@ -1,0 +1,37 @@
+# ==============================================================================
+# TAURIDAsProt - Taxonomic exclusion template
+# ==============================================================================
+
+################################################################################
+# Rules:
+#   - Higher taxa use Exclude_descendants=TRUE.
+#   - Explicit species use Exclude_descendants=FALSE.
+#   - Taxid="." asks TAURIDAsProt to resolve the current NCBI Taxonomy ID.
+#
+# Interaction with seed_taxa.tsv:
+#
+#   broad exclusion + ordinary descendant
+#       -> EXCLUDED
+#
+#   broad exclusion + explicit species inclusion
+#       -> INCLUDED
+#          Exclusion_override=TRUE
+#          Override_reason=EXPLICIT_SPECIES_INCLUDE
+#
+#   explicit species exclusion + explicit species inclusion
+#       -> WAITING_FOR_CURATION_FIX
+#
+# Blank lines and lines beginning with # are ignored.
+# Optional: add the taxa that should be excluded from your study.
+# The examples are commented out and are NOT excluded by default.
+# Remove the leading "# " from any example row you want to use.
+################################################################################
+
+Taxon_name	Taxid	Exclude_descendants	Reason	Reference	Notes
+
+# Example 1: Exclude an entire bacterial genus and its descendants.
+# TAURIDAsProt will resolve the current NCBI Taxonomy ID.
+# Salmonella	.	TRUE	user_exclusion	.	Example genus-wide exclusion.
+#
+# Example 2: Exclude one animal species using its known Taxid.
+# Homo sapiens	9606	FALSE	user_exclusion	.	Example species-specific exclusion.

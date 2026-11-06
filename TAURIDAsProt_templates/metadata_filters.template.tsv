@@ -1,6 +1,9 @@
 # ==============================================================================
-# FungiFunk_refdb metadata filters template
+# TAURIDAsProt metadata filters template
 # ==============================================================================
+
+################################################################################
+# Rules:
 #
 # IMPORTANT:
 #   All ACTIVE rules are combined using AND.
@@ -105,20 +108,16 @@
 #   --metadata-filters file is supplied.
 #
 #   "species Taxon_name present" is therefore included as a deliberate no-op.
-#   It does not restrict a normally resolved FungiFunk species set.
+#   It does not restrict a normally resolved TAURIDAsProt species set.
 #
 # Blank lines and lines beginning with # are ignored.
-# ==============================================================================
+# Remove the leading "# " from any example row you want to use.
+################################################################################
 
 Level	Field	Operator	Value	Case_sensitive	Notes
 species	Taxon_name	present	.	.	DEFAULT_NO_OP: keeps all normally resolved species while allowing this file to be supplied unchanged.
 
-# ------------------------------------------------------------------------------
-# EXAMPLES - COMMENTED OUT AND THEREFORE INACTIVE
-# ------------------------------------------------------------------------------
-
 # Require a nomenclatural Authority value.
-# This does NOT mean that FungiFunk interprets Authority as publication evidence.
 # species	Authority	present	.	.	Require NCBI nomenclatural authority metadata.
 
 # Restrict to a specific genus.

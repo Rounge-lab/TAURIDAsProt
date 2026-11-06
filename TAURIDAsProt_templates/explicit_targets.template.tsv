@@ -1,0 +1,53 @@
+# ==============================================================================
+# TAURIDAsProt - Explicit strain / assembly target template
+# ==============================================================================
+
+################################################################################
+# Rules:
+# This same TSV schema is used by:
+#
+#   --include-explicit-targets
+#   --exclude-explicit-targets
+#
+# The command-line option determines whether every row in the supplied file is
+# an inclusion or an exclusion. If both actions are needed, create and supply
+# separate include and exclude TSV files.
+#
+# Supported Target_type values:
+#
+#   strain
+#     - Strain is required.
+#     - At least one of Species or Taxid is required.
+#     - Assembly_accession must be ".".
+#
+#   assembly
+#     - Assembly_accession is required.
+#     - The accession must be an exact versioned GCF/GCA accession, for example
+#       GCF_000000001.1.
+#     - Species, Taxid and Strain are optional identity hints. When supplied,
+#       they are validated against the resolved NCBI record.
+#
+# Evidence_type and Notes are optional provenance fields.
+#
+# Examples:
+# Target_type	Species	Taxid	Strain	Assembly_accession	Evidence_type	Notes
+# strain	Example species	12345	Example strain	.	user_requested	Example strain target
+# assembly	Example species	12345	.	GCF_000000001.1	user_requested	Example exact assembly target
+#
+# Blank lines and lines beginning with # are ignored.
+# Real NCBI examples below are commented out and are NOT active by default.
+# Remove the leading "# " from any example row you want to use.
+################################################################################
+
+Target_type	Species	Taxid	Strain	Assembly_accession	Evidence_type	Notes
+
+# Example 1: Target Bacillus subtilis strain 168.
+# The assembly accession must be "." for a strain target.
+# strain	Bacillus subtilis	1423	168	.	user_requested	Target the documented strain 168.
+#
+# Example 2: Target an exact versioned RefSeq assembly of Escherichia coli.
+# Species, Taxid and Strain are omitted because they are optional for assemblies.
+# assembly	.	.	.	GCF_000005845.2	user_requested	E. coli K-12 MG1655 reference assembly.
+#
+# Example 3: Target a human RefSeq assembly with species identity hints.
+# assembly	Homo sapiens	9606	.	GCF_000001405.40	user_requested	GRCh38.p14 reference assembly.

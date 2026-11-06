@@ -1,0 +1,46 @@
+# ==============================================================================
+# TAURIDAsProt - Taxonomic inclusion template
+# ==============================================================================
+
+################################################################################
+# Rules:
+#   - Higher taxa use Include_descendants=TRUE.
+#   - Explicit species use Include_descendants=FALSE.
+#   - Taxid="." asks TAURIDAsProt to resolve the current NCBI Taxonomy ID.
+#   - Tier must be 1, 2, or 3.
+#
+# Tier interpretation:
+#   Tier 1, Tier 2 and Tier 3 are user-defined curation categories.
+#   Their biological interpretation depends on the study and selected taxa.
+#
+# IMPORTANT:
+#   A Tier assigned to a higher taxon is a default inherited by descendant
+#   species unless a more specific seed rule overrides it.
+#
+# Precedence:
+#   explicit species Tier
+#       >
+#   most specific matching seed taxon
+#       >
+#   broader matching seed taxon
+#
+# Evidence_type is metadata and does NOT control inclusion by itself.
+#
+# Blank lines and lines beginning with # are ignored.
+# Add the taxa relevant to your study below.
+# The examples are commented out and are NOT included by default.
+# Remove the leading "# " from any example row you want to use.
+# At least one valid inclusion rule must be provided to build a reference.
+################################################################################
+
+Taxon_name	Taxid	Include_descendants	Tier	Evidence_type	Reference	Notes
+
+# Example 1: Include one bacterial species using its known NCBI Taxonomy ID.
+# Escherichia coli	562	FALSE	1	study_example	.	Example species with an explicit Taxid.
+#
+# Example 2: Include a plant genus and its descendant species.
+# TAURIDAsProt will resolve the current NCBI Taxonomy ID.
+# Arabidopsis	.	TRUE	2	study_example	.	Example genus with descendant inclusion.
+#
+# Example 3: Include one animal species with an explicit Taxid.
+# Mus musculus	10090	FALSE	3	study_example	.	Example species with an explicit Taxid.

@@ -1,17 +1,15 @@
-# FungiFunk_refdb
+# TAURIDAsProt
 
-**A tool for building and maintaining reproducible protein reference databases from NCBI Datasets.**
+**- Taxon-guided Assembly and Updating of Reference databases through Identity-based Deduplication of protein sequences derived from genome Assemblies -**
 
-FungiFunk_refdb is a command-line tool that creates protein reference databases from genome assemblies available through NCBI.
+TAURIDAsProt is a command-line tool for building and maintaining protein reference databases using genome assemblies from NCBI Datasets.
 
-It allows users to choose which organisms and assemblies to include, retrieve their protein sequences, remove identical proteins, and keep track of the original sources of every protein in the database.
+You choose which organisms and assemblies to include. TAURIDAsProt retrieves their proteins, keeps each unique sequence only once, and records all the original sources of that sequence.
 
-The tool also supports resuming interrupted runs, updating existing databases, and retrying failed NCBI downloads without rebuilding the entire reference.
+It can also resume interrupted runs, update existing references while reusing previous work, and retry failed NCBI downloads without repeating the full assembly search.
 
-**Current version:** v0.5.0  
+**Current version:** v0.6.0
 **Status:** Active development
-
-> **A note on the name:** FungiFunk_refdb was originally developed as part of the FungiFunk project. Despite its current name, the tool is not limited to fungi and can be used with other taxa. A future name change is planned to better reflect its broader scope.
 
 ## Key features
 
@@ -23,20 +21,24 @@ The tool also supports resuming interrupted runs, updating existing databases, a
 - **Safely replace existing databases** only after the updated reference has been validated.
 - **Retry failed NCBI protein downloads** in completed databases without performing a full update.
 - **Generate detailed metadata and reports** describing database contents, selection decisions, and processing results.
+- **Save console output and run logs** so progress, warnings, and errors can be reviewed after an execution.
 
 ## Installation
 
-FungiFunk_refdb runs from the command line using Bash and Python.
+TAURIDAsProt runs from the command line using Bash and Python.
 
-A Conda environment configuration file, `FungiFunk_refdb.yml`, is provided in the root directory of the repository.
+A Conda environment configuration file, `TAURIDAsProt.yml`, is provided in the root directory of the repository.
 
-### 1. Get FungiFunk_refdb
+### 1. Get TAURIDAsProt
 
-Clone or download the repository and navigate to its main directory:
+Clone the repository and move into its directory:
 
 ```bash
-cd FungiFunk_refdb
+git clone https://github.com/Rounge-lab/TAURIDAsProt.git
+cd TAURIDAsProt
 ```
+
+Alternatively, download the repository as a ZIP file, extract it, and open the extracted directory in your terminal.
 
 ### 2. Create the Conda environment
 
@@ -45,13 +47,13 @@ Make sure Conda is installed and available in your terminal.
 Create an environment using the provided YAML file:
 
 ```bash
-conda env create -f FungiFunk_refdb.yml -n FungiFunk_refdb
+conda env create -f TAURIDAsProt.yml -n TAURIDAsProt
 ```
 
 Activate it:
 
 ```bash
-conda activate FungiFunk_refdb
+conda activate TAURIDAsProt
 ```
 
 ### 3. Check the installation
@@ -59,20 +61,20 @@ conda activate FungiFunk_refdb
 Display the available options:
 
 ```bash
-bash FungiFunk_refdb.sh --help
+bash TAURIDAsProt.sh --help
 ```
 
 Check the software version:
 
 ```bash
-bash FungiFunk_refdb.sh --version
+bash TAURIDAsProt.sh --version
 ```
 
-The Bash script is the recommended entry point for running FungiFunk_refdb.
+The Bash script is the recommended entry point for running TAURIDAsProt.
 
 ## Run modes
 
-FungiFunk_refdb provides five mutually exclusive run modes:
+TAURIDAsProt provides five mutually exclusive run modes:
 
 | Run mode | Description |
 | --- | --- |
@@ -86,14 +88,22 @@ Exactly one run mode must be selected for each execution.
 
 ## Getting started
 
-The following examples illustrate how to run FungiFunk_refdb.
+The following examples illustrate how to run TAURIDAsProt.
 
 ### 1. Create a new reference database
 
-Create a database using a TSV file defining the taxa to include:
+First, copy the taxon inclusion template:
 
 ```bash
-bash FungiFunk_refdb.sh \
+cp TAURIDAsProt_templates/seed_taxa.template.tsv seed_taxa.tsv
+```
+
+Open `seed_taxa.tsv` and choose which organisms to include. The template contains commented examples to help you get started. You can uncomment and edit these examples, or add your own taxa.
+
+Once your input file contains at least one active inclusion rule, create the reference:
+
+```bash
+bash TAURIDAsProt.sh \
     --create \
     --seed-taxa seed_taxa.tsv \
     --outdir reference_db
@@ -107,28 +117,71 @@ Here:
 
 The output directory must be new or empty.
 
-A seed-taxa file is not the only way to define the reference. Specific assemblies or strains can also be requested using `--include-explicit-targets`.
+You can also create a reference using specific strains or genome assemblies, without a seed-taxa file.
 
-Input templates are available in the `FungiFunk_refdb_templates/` directory.
+Copy the explicit-target template:
+
+```bash
+cp TAURIDAsProt_templates/explicit_targets.template.tsv explicit_targets.tsv
+```
+
+Edit the file to include the strains or assemblies you want.
+
+Then run:
+
+```bash
+bash TAURIDAsProt.sh \
+    --create \
+    --include-explicit-targets explicit_targets.tsv \
+    --outdir explicit_reference_db
+```
+
+You can use `--seed-taxa`, `--include-explicit-targets`, or both.
+
+All four input templates are available in the `TAURIDAsProt_templates/` directory.
 
 ### 2. Resume an interrupted run
 
 If a database-building run is interrupted after a suitable recovery checkpoint has been created, it can be resumed:
 
 ```bash
-bash FungiFunk_refdb.sh \
+bash TAURIDAsProt.sh \
     --resume \
     --outdir reference_db
 ```
 
-FungiFunk_refdb uses its saved state to continue the interrupted operation without unnecessarily repeating completed work.
+TAURIDAsProt can resume an interrupted build from its last saved recovery point, once the initial setup has been completed and the build is ready for recovery.
+
+For most stages, this means continuing from the last completed stage.
+
+Two stages support more detailed, species-by-species recovery:
+
+- **Assembly search and selection:** If interrupted, TAURIDAsProt keeps the assembly information already saved for completed species and continues with the remaining species.
+- **Protein retrieval and processing:** If interrupted, TAURIDAsProt keeps successfully completed protein-processing results and continues with species that still need processing.
+
+This means that interruptions during these two stages do not require repeating all the work completed earlier in the same stage.
+
+Work that was interrupted before being safely saved may need to be repeated.
+
+Some options determine which organisms and genome assemblies are included in the reference. TAURIDAsProt calls these its *biological configuration*. For example, they include:
+
+- Taxa to include or exclude (`--seed-taxa`, `--exclude-taxa`, etc).
+- Specific strains or assemblies (`--include-explicit-targets`, `--exclude-explicit-targets`).
+- Assembly quality requirements (`--min-contig-n50`, `--require-busco`, etc).
+- Assembly selection limits (`--max-strains-per-species`, `--max-assemblies-per-species`, etc).
+
+These options can still be corrected when resuming a run, provided assembly search has not yet started. Once that stage begins, they are locked to keep the reference consistent.
+
+Other settings, such as the number of workers (`--workers`) or the temporary directory (`--tmpdir`), can still be adjusted during resume when applicable.
+
+For the complete list of biological configuration options, see the `BIOLOGICAL CONFIGURATION` section in `--help`.
 
 ### 3. Create a new updated version
 
 Create an updated reference while preserving the previous version:
 
 ```bash
-bash FungiFunk_refdb.sh \
+bash TAURIDAsProt.sh \
     --create-new-updated-version \
     --source-refdb reference_db \
     --outdir reference_db_updated
@@ -143,7 +196,7 @@ By default, the biological selection settings are inherited from the original re
 Update a database and replace the original version after successful validation:
 
 ```bash
-bash FungiFunk_refdb.sh \
+bash TAURIDAsProt.sh \
     --overwrite-with-updated-version \
     --outdir reference_db
 ```
@@ -154,14 +207,12 @@ The original database remains available while the update is being prepared and i
 
 ### 5. Retry failed NCBI protein downloads
 
-*Introduced in v0.3.1.*
-
 Occasionally, NCBI protein retrieval may fail for one or more assemblies. These failures can remain recorded in an otherwise completed database.
 
-FungiFunk_refdb can retry eligible unresolved failures without performing a full database update:
+TAURIDAsProt can retry eligible unresolved protein-download failures without repeating the full NCBI assembly search:
 
 ```bash
-bash FungiFunk_refdb.sh \
+bash TAURIDAsProt.sh \
     --retry-ncbi-failures \
     --source-refdb reference_db
 ```
@@ -181,7 +232,7 @@ Unlike the other run modes, `--retry-ncbi-failures` does not require `--outdir`.
 
 ## Customising your reference
 
-FungiFunk_refdb provides options to control which taxa and genome assemblies contribute proteins to the database.
+TAURIDAsProt provides options to control which taxa and genome assemblies contribute proteins to the database.
 
 ### Selecting taxa
 
@@ -193,7 +244,7 @@ You can also provide files containing explicit strain or assembly inclusion and 
 
 ### Selecting genome assemblies
 
-By default, FungiFunk_refdb considers eligible RefSeq (GCF) assemblies and uses a strain-based selection strategy.
+By default, TAURIDAsProt considers eligible RefSeq (GCF) assemblies and uses a strain-based selection strategy.
 
 Some options for modifying assembly selection include:
 
@@ -223,24 +274,22 @@ Optional numerical quality thresholds are not applied unless explicitly requeste
 Templates for the main input files are available in:
 
 ```text
-FungiFunk_refdb_templates/
-    fungal_seed_taxa.template.tsv
-    fungal_exclusion_taxa.template.tsv
+TAURIDAsProt_templates/
+    seed_taxa.template.tsv
+    exclusion_taxa.template.tsv
     metadata_filters.template.tsv
     explicit_targets.template.tsv
 ```
 
-Some input and output filenames retain the original project naming. These names may be updated in future versions.
-
 For a complete description of the available options and input formats, use:
 
 ```bash
-bash FungiFunk_refdb.sh --help
+bash TAURIDAsProt.sh --help
 ```
 
 ## Output files
 
-A completed FungiFunk_refdb run produces a protein reference database, associated metadata, reports, and saved state information.
+A completed TAURIDAsProt run produces a protein reference database, associated metadata, reports, and saved state information.
 
 ### Protein reference
 
@@ -248,7 +297,7 @@ The main output is:
 
 ```text
 database/
-    FungiFunk_protein_refdb.faa
+    TAURIDAsProt_protein_refdb.faa
 ```
 
 This FASTA file contains the unique protein sequences selected for the reference database.
@@ -261,16 +310,32 @@ Some of the main files are:
 
 ```text
 metadata/
-    fungal_species_master.tsv
-    fungal_assemblies_master.tsv
-    fungal_protein_metadata.tsv
-    fungal_protein_sources.tsv
+    species_master.tsv
+    assemblies_master.tsv
+    protein_metadata.tsv
+    protein_sources.tsv
+    protein_sources.yaml.gz
     reproduction_targets.tsv
 ```
 
 These tables make it possible to identify the original sources of the proteins included in the reference.
 
-`reproduction_targets.tsv` records the exact assembly accessions selected for the completed database. It can be used as an input file when attempting to recreate a reference using the same assembly targets.
+`protein_sources.tsv` lists the original protein records contributing to the reference, including multiple sources for identical sequences.
+
+`protein_sources.yaml.gz` provides grouped provenance information in a compressed format.
+
+`reproduction_targets.tsv` contains the exact versioned genome assembly accessions selected for the completed reference.
+
+You can use this file to create another reference from the same assembly targets, without preparing a new seed-taxa file:
+
+```bash
+bash TAURIDAsProt.sh \
+    --create \
+    --include-explicit-targets reference_db/metadata/reproduction_targets.tsv \
+    --outdir reproduced_reference_db
+```
+
+This requests the same assemblies as the original reference. However, successful reproduction still depends on those assemblies and their protein sequences remaining available from NCBI.
 
 ### Reports
 
@@ -292,13 +357,25 @@ Additional reports describe excluded taxa, filtering decisions, and changes intr
 
 The `state/` directory stores the information required to track progress, resume interrupted runs, and verify completed references.
 
-These files are managed automatically by FungiFunk_refdb.
+These files are managed automatically by TAURIDAsProt.
+
+### Logs
+
+TAURIDAsProt saves a record of what happens during each run.
+
+The `logs/` directory contains records of each execution.
+
+TAURIDAsProt automatically saves the console output to a file named `console_<run_id>.log`, allowing you to review progress messages, warnings, and errors after a run has finished or been interrupted.
+
+The run information log (`build_info.log`) also records details such as the command options and software versions used.
+
+For interrupted or unsuccessful updates, some logs may be kept in the temporary working directory or alongside the original reference. This allows you to investigate the problem without modifying a previously completed database.
 
 ## How does protein deduplication work?
 
 Different assemblies, strains, or species may contain proteins with exactly the same amino acid sequence.
 
-FungiFunk_refdb identifies these identical proteins and stores each unique sequence only once in the final FASTA file.
+TAURIDAsProt identifies these identical proteins and stores each unique sequence only once in the final FASTA file.
 
 This reduces unnecessary duplication while preserving the biological information associated with each protein.
 
@@ -306,11 +383,21 @@ This reduces unnecessary duplication while preserving the biological information
 
 The accompanying metadata records all contributing protein sources, allowing users to trace reference proteins back to their original assemblies and organisms.
 
-Only proteins with identical complete canonical amino acid sequences are combined.
+Before comparing proteins, TAURIDAsProt removes FASTA formatting whitespace, converts letters to uppercase, and ignores a final translation-stop marker (`*`) when determining sequence identity. The original stop marker is still recorded in the provenance information.
+
+Only proteins whose complete processed sequences are identical are combined. Similar but non-identical proteins remain separate.
+
+## Resource use and safety
+
+TAURIDAsProt can automatically choose the number of workers based on the available CPUs, memory, and disk space.
+
+You can also choose the number of workers yourself using `--workers`. The `--force` option allows an explicitly requested worker count to exceed the program's recommendation, but it does not disable disk-space protection, integrity checks, or NCBI request limits.
+
+When updating an existing reference, TAURIDAsProt uses a separate working directory so that the original database remains available until the new version is ready and validated.
 
 ## Reproducibility and database integrity
 
-FungiFunk_refdb is designed to make reference construction reproducible and protect existing results.
+TAURIDAsProt is designed to make reference construction reproducible and protect existing results.
 
 It records the biological configuration, assembly selection, protein sources, and relevant processing information.
 
@@ -322,15 +409,11 @@ Completed references include an integrity manifest and completion information to
 
 ## Project development
 
-FungiFunk_refdb is under active development. Additional functionality, improvements, and documentation are planned for future versions.
-
-Version **0.3.1** introduces targeted recovery of previously failed NCBI protein downloads from completed reference databases.
-
-The project is also expected to be renamed in a future version to better reflect its applicability beyond fungi.
+TAURIDAsProt is under active development. Additional functionality, improvements, and documentation are planned for future versions.
 
 ## Development and maintenance
 
-FungiFunk_refdb was originally developed by **Blanca Candelas Galavis** as part of her PhD research in the [Rounge group](https://www.mn.uio.no/bils/english/groups/rounge-group/index.html) at the University of Oslo (UiO), Norway.
+TAURIDAsProt was originally developed by **Blanca Candelas Galavis** as part of her PhD research in the [Rounge group](https://www.mn.uio.no/bils/english/groups/rounge-group/index.html) at the University of Oslo (UiO), Norway.
 
 The tool is currently maintained by **Blanca Candelas Galavis**.
 
@@ -338,7 +421,7 @@ Additional contributors and future maintainers will be acknowledged here as the 
 
 ## License
 
-FungiFunk_refdb is distributed under the **GNU General Public License, version 3 (GPLv3)**.
+TAURIDAsProt is distributed under the **GNU General Public License, version 3 (GPLv3)**.
 
 See the [LICENSE](LICENSE) file for the full license text.
 

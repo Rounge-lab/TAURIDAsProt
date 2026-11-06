@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FungiFunk_refdb.sh
+# TAURIDAsProt.sh
 # ==============================================================================
 
 # Stop the script on command failures, undefined variables or hidden errors in pipes
@@ -8,22 +8,22 @@ set -euo pipefail
 
 # Define the path to the location of the script
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-PYTHON_SCRIPT="${script_dir}/FungiFunk_refdb.py"
-TEMPLATE_DIR="${script_dir}/FungiFunk_refdb_templates"
+PYTHON_SCRIPT="${script_dir}/TAURIDAsProt.py"
+TEMPLATE_DIR="${script_dir}/TAURIDAsProt_templates"
 
 # Define the name, version and final output file of the tool
-TOOL_NAME="FungiFunk_refdb"
-VERSION="0.5.0"
-FINAL_FASTA_NAME="FungiFunk_protein_refdb.faa"
+TOOL_NAME="TAURIDAsProt"
+VERSION="0.6.0"
+FINAL_FASTA_NAME="TAURIDAsProt_protein_refdb.faa"
 
-# Internal paths used by FungiFunk_refdb
-REFDB_MARKER_REL="state/.fungifunk_refdb"
+# Internal paths used by TAURIDAsProt
+REFDB_MARKER_REL="state/.tauridasprot"
 STATE_DB_REL="state/build_state.sqlite"
 BUILD_MANIFEST_REL="state/build_manifest.tsv"
 FINAL_FASTA_REL="database/${FINAL_FASTA_NAME}"
 BASIC_LOG_REL="logs/build_info.log"
-RESUME_READY_REL="state/.fungifunk_refdb_resume_ready.json"
-COMPLETION_MARKER_REL="state/.fungifunk_refdb_complete.json"
+RESUME_READY_REL="state/.tauridasprot_resume_ready.json"
+COMPLETION_MARKER_REL="state/.tauridasprot_complete.json"
 
 # Preserve the original command-line arguments exactly as supplied
 ORIGINAL_ARGS=("$@")
@@ -58,18 +58,24 @@ log_msg() {
 ########################################################################################################
 
 Help() {
-    echo " _____                  _ _____            _                  __     _ _          "
-    echo "|  ___|   _ _ __   __ _(_)  ___|   _ _ __ | | __    _ __ ___ / _| __| | |__       "
-    echo "| |_ | | | |  _ \ / _  | | |_ | | | |  _ \| |/ /   |  __/ _ \ |_ / _  | '_ \      "
-    echo "|  _|| |_| | | | | (_| | |  _|| |_| | | | |   <    | | |  __/  _| (_| | |_) |     "
-    echo "|_|   \__,_|_| |_|\__, |_|_|   \__,_|_| |_|_|\_\___|_|  \___|_|  \__,_|_.__/      "
-    echo "                  |___/                                                           "
+    echo " _____  _   _   _ ____  ___ ____    _        ____            _   "
+    echo "|_   _|/ \ | | | |  _ \|_ _|  _ \  / \   ___|  _ \ _ __ ___ | |_ "
+    echo "  | | / _ \| | | | |_) || || | | |/ _ \ / __| |_) | '__/ _ \| __|"
+    echo "  | |/ ___ \ |_| |  _ < | || |_| / ___ \\\\__ \  __/| | | (_) | |_ "
+    echo "  |_/_/   \_\___/|_| \_\___|____/_/   \_\___/_|   |_|  \___/ \__|"
     echo ""
-    echo "${TOOL_NAME} v${VERSION}: build and maintain the FungiFunk fungal protein reference database"
     echo ""
-    echo "FungiFunk_refdb builds, resumes, or incrementally updates a reproducible fungal"
-    echo "protein reference database from NCBI Datasets for downstream FungiFunk functional"
-    echo "profiling."
+    echo "${TOOL_NAME} v${VERSION}: Taxon-guided Assembly and Updating of Reference databases "
+    echo "through Identity-based Deduplication of protein sequences derived from genome Assemblies."
+    echo ""
+    echo "TAURIDAsProt builds, resumes, and incrementally updates reproducible protein"
+    echo "reference databases from genome assemblies available through NCBI Datasets."
+    echo "Users can select taxa and assemblies, retrieve their protein sequences,"
+    echo "and perform exact amino-acid sequence deduplication across the reference."
+    echo "Every unique protein retains traceable provenance information linking it"
+    echo "to all its original protein records, source assemblies, and taxa."
+    echo "Interrupted runs can be resumed, and existing references can be updated"
+    echo "while reusing previously processed data whenever possible."
     echo ""
     echo "Final protein reference:"
     echo "  ${FINAL_FASTA_NAME}"
@@ -90,33 +96,35 @@ Help() {
     echo "       RUN MODES          "
     echo "##########################"
     echo "  --create"
-    echo "      Create a completely NEW fungal protein reference database."
+    echo "      Create a completely NEW protein reference database."
     echo ""
     echo "      Required:"
-    echo "        --seed-taxa <file>"
     echo "        -o, --outdir <dir>"
+    echo "        At least one of:"
+    echo "            --seed-taxa <file>"
+    echo "            --include-explicit-targets <file>"
     echo ""
     echo "      Optional:"
     echo "        --exclude-taxa <file>"
     echo "          Explicit taxonomic exclusions. If omitted, no taxa are excluded"
     echo "          by explicit exclusion rules."
     echo ""
-    echo "      --create never resumes, cleans or overwrites an existing FungiFunk_refdb"
+    echo "      --create never resumes, cleans or overwrites an existing TAURIDAsProt"
     echo "      build."
     echo ""
     echo "      The output directory must be new or empty."
     echo ""
-    echo "      If the directory contains a resumable FungiFunk_refdb build, use --resume."
+    echo "      If the directory contains a resumable TAURIDAsProt build, use --resume."
     echo ""
-    echo "      If the directory contains a completed FungiFunk_refdb reference, use an"
+    echo "      If the directory contains a completed TAURIDAsProt reference, use an"
     echo "      update mode rather than --create."
     echo ""
-    echo "      A non-empty directory that is not recognized as FungiFunk_refdb is never"
+    echo "      A non-empty directory that is not recognized as TAURIDAsProt is never"
     echo "      modified or cleaned automatically."
     echo ""
     echo ""
     echo "  --resume"
-    echo "      Continue the SAME interrupted build from persistent FungiFunk_refdb state."
+    echo "      Continue the SAME interrupted build from persistent TAURIDAsProt state."
     echo ""
     echo "      Required:"
     echo "        -o, --outdir <dir>"
@@ -128,7 +136,7 @@ Help() {
     echo "      available. Correct the original problem, manually remove the incomplete"
     echo "      output directory (or its contents), and start again with --create."
     echo ""
-    echo "      FungiFunk_refdb never removes that incomplete directory automatically."
+    echo "      TAURIDAsProt never removes that incomplete directory automatically."
     echo ""
     echo "      Biological configuration is editable during pre-assembly resume, until"
     echo "      ASSEMBLY_SEARCH_AND_SELECTION begins."
@@ -169,14 +177,14 @@ Help() {
     echo ""
     echo ""
     echo "  --create-new-updated-version"
-    echo "      Incrementally update a completed FungiFunk_refdb database while preserving"
+    echo "      Incrementally update a completed TAURIDAsProt database while preserving"
     echo "      the previous version unchanged."
     echo ""
     echo "      Required:"
     echo "        --source-refdb <dir>"
     echo "        -o, --outdir <dir>"
     echo ""
-    echo "      --source-refdb must be a completed, validated FungiFunk_refdb reference."
+    echo "      --source-refdb must be a completed, validated TAURIDAsProt reference."
     echo ""
     echo "      --source-refdb and --outdir MUST be different directories."
     echo ""
@@ -216,7 +224,7 @@ Help() {
     echo ""
     echo "  --retry-ncbi-failures"
     echo "    Retry unresolved NCBI protein retrieval failures recorded in an existing"
-    echo "    completed FungiFunk_refdb reference."
+    echo "    completed TAURIDAsProt reference."
     echo ""
     echo "    Required:"
     echo "        --source-refdb <dir>"
@@ -238,8 +246,8 @@ Help() {
     echo "##########################"
     echo " BIOLOGICAL CONFIGURATION "
     echo "##########################"
-    echo "In FungiFunk_refdb, biological configuration means the inputs and settings"
-    echo "that determine which fungal taxa and genome assemblies can contribute"
+    echo "In TAURIDAsProt, biological configuration means the inputs and settings"
+    echo "that determine which taxa and genome assemblies can contribute"
     echo "proteins to the reference database."
     echo ""
     echo "The complete list of biological configuration options is:"
@@ -367,7 +375,7 @@ Help() {
     echo "      Not changeable after ASSEMBLY_SEARCH_AND_SELECTION has started."
     echo ""
     echo "      Template:"
-    echo "        ${TEMPLATE_DIR}/fungal_seed_taxa.template.tsv"
+    echo "        ${TEMPLATE_DIR}/seed_taxa.template.tsv"
     echo ""
     echo "  --exclude-taxa <file>"
     echo "      Explicit taxonomic exclusion TSV."
@@ -386,7 +394,7 @@ Help() {
     echo "      Not changeable after ASSEMBLY_SEARCH_AND_SELECTION has started."
     echo ""
     echo "      Template:"
-    echo "        ${TEMPLATE_DIR}/fungal_exclusion_taxa.template.tsv"
+    echo "        ${TEMPLATE_DIR}/exclusion_taxa.template.tsv"
     echo ""
     echo "  --metadata-filters <file>"
     echo "      Optional advanced species/assembly metadata-filter TSV."
@@ -415,7 +423,7 @@ Help() {
     echo "      Supported target types:"
     echo "        strain"
     echo "          Requires Strain and at least one of Species or Taxid."
-    echo "          FungiFunk selects the best usable eligible assembly for that strain."
+    echo "          TAURIDAsProt selects the best usable eligible assembly for that strain."
     echo ""
     echo "        assembly"
     echo "          Requires an exact versioned GCF/GCA accession."
@@ -456,11 +464,11 @@ Help() {
     echo "Paths and identifiers:"
     echo ""
     echo "  -o, --outdir <dir>"
-    echo "      Target/current FungiFunk_refdb directory."
+    echo "      Target/current TAURIDAsProt directory."
     echo "      Required in all run modes except --retry-ncbi-failures."
     echo ""
     echo "  --source-refdb <dir>"
-    echo "      Completed and validated FungiFunk_refdb reference."
+    echo "      Completed and validated TAURIDAsProt reference."
     echo "    Required by --create-new-updated-version and --retry-ncbi-failures."
     echo ""
     echo "    During manual NCBI recovery, this identifies the completed reference"
@@ -502,7 +510,7 @@ Help() {
     echo "      disabled freely on resume."
     echo ""
     echo "  --version"
-    echo "      Show FungiFunk_refdb version and exit."
+    echo "      Show TAURIDAsProt version and exit."
     echo ""
     echo "  -h, --help"
     echo "      Show this help message and exit."
@@ -528,7 +536,7 @@ Help() {
     echo "##########################"
     echo "     DEFAULT QC RULES     "
     echo "##########################"
-    echo "By default FungiFunk_refdb excludes:"
+    echo "By default TAURIDAsProt excludes:"
     echo ""
     echo "  - NCBI atypical assemblies"
     echo "  - suppressed or withdrawn assemblies"
@@ -781,7 +789,7 @@ Help() {
     echo ""
     echo "Unknown metadata fields or operators are rejected rather than silently ignored."
     echo ""
-    echo "FungiFunk_refdb uses a documented whitelist of normalized metadata fields."
+    echo "TAURIDAsProt uses a documented whitelist of normalized metadata fields."
     echo ""
     echo "Examples of species fields include:"
     echo "  Taxon_name"
@@ -842,7 +850,7 @@ Help() {
     echo "        - output/staging-disk space"
     echo ""
     echo "  --force"
-    echo "      Override only FungiFunk_refdb's calculated local worker recommendation."
+    echo "      Override only TAURIDAsProt's calculated local worker recommendation."
     echo ""
     echo "      --force requires an explicit numeric --workers value."
     echo ""
@@ -858,7 +866,7 @@ Help() {
     echo "##########################"
     echo "    PROTEIN IDENTITY      "
     echo "##########################"
-    echo "FungiFunk_refdb performs exact canonical amino-acid sequence deduplication."
+    echo "TAURIDAsProt performs exact canonical amino-acid sequence deduplication."
     echo ""
     echo "Protein sequence normalization:"
     echo ""
@@ -887,15 +895,15 @@ Help() {
     echo "Metadata:"
     echo ""
     echo "  metadata/"
-    echo "      fungal_seed_taxa_resolved.tsv"
-    echo "      fungal_exclusion_taxa_resolved.tsv"
+    echo "      seed_taxa_resolved.tsv"
+    echo "      exclusion_taxa_resolved.tsv"
     echo "      metadata_filters_resolved.tsv"
-    echo "      fungal_species_master.tsv"
-    echo "      fungal_species_master.xlsx              [if openpyxl is available]"
-    echo "      fungal_assemblies_master.tsv"
-    echo "      fungal_assemblies_master.xlsx           [if openpyxl is available]"
-    echo "      fungal_protein_metadata.tsv"
-    echo "      fungal_protein_sources.tsv"
+    echo "      species_master.tsv"
+    echo "      species_master.xlsx              [if openpyxl is available]"
+    echo "      assemblies_master.tsv"
+    echo "      assemblies_master.xlsx           [if openpyxl is available]"
+    echo "      protein_metadata.tsv"
+    echo "      protein_sources.tsv"
     echo ""
     echo "Reports:"
     echo ""
@@ -913,10 +921,10 @@ Help() {
     echo "Persistent state:"
     echo ""
     echo "  state/"
-    echo "      .fungifunk_refdb"
-    echo "          Marks the directory as a recognized FungiFunk_refdb build."
+    echo "      .tauridasprot"
+    echo "          Marks the directory as a recognized TAURIDAsProt build."
     echo ""
-    echo "      .fungifunk_refdb_resume_ready.json"
+    echo "      .tauridasprot_resume_ready.json"
     echo "          Written only after enough persistent state exists for safe --resume."
     echo ""
     echo "      build_state.sqlite"
@@ -925,7 +933,7 @@ Help() {
     echo "      build_manifest.tsv"
     echo "          Final cryptographic inventory of completed reference contents."
     echo ""
-    echo "      .fungifunk_refdb_complete.json"
+    echo "      .tauridasprot_complete.json"
     echo "          Final completion marker written only after the manifest is verified."
     echo ""
     echo "A SQLite state of DONE by itself does not define an officially completed"
@@ -939,7 +947,7 @@ Help() {
     echo "##########################"
     echo "    UPDATE / RESUME       "
     echo "##########################"
-    echo "FungiFunk_refdb uses persistent state and explicit checkpoints so interrupted"
+    echo "TAURIDAsProt uses persistent state and explicit checkpoints so interrupted"
     echo "builds can be recovered conservatively."
     echo ""
     echo "Recovery rules:"
@@ -953,7 +961,7 @@ Help() {
     echo "     --resume is unavailable. Correct the problem, manually remove the"
     echo "     incomplete output directory (or its contents), and rerun --create."
     echo ""
-    echo "  4. FungiFunk_refdb never automatically deletes an incomplete output"
+    echo "  4. TAURIDAsProt never automatically deletes an incomplete output"
     echo "     directory or unrelated user files."
     echo ""
     echo "Biological lock boundary:"
@@ -1027,7 +1035,7 @@ Help() {
     echo "  - DONE is written before the final manifest is generated"
     echo "  - build_manifest.tsv inventories the final reference"
     echo "  - the manifest is verified"
-    echo "  - .fungifunk_refdb_complete.json is written last"
+    echo "  - .tauridasprot_complete.json is written last"
     echo ""
     echo "Therefore DONE without a valid completion marker is treated as an interrupted"
     echo "final commit and remains recoverable rather than being accepted as complete."
@@ -1040,18 +1048,18 @@ Help() {
     echo ""
     echo "  ${TOOL_NAME}.sh \\"
     echo "      --create \\"
-    echo "      --seed-taxa fungal_seed_taxa.tsv \\"
-    echo "      --exclude-taxa fungal_exclusion_taxa.tsv \\"
-    echo "      --outdir FungiFunk_refdb"
+    echo "      --seed-taxa seed_taxa.tsv \\"
+    echo "      --exclude-taxa exclusion_taxa.tsv \\"
+    echo "      --outdir TAURIDAsProt"
     echo ""
     echo ""
     echo "-> Create a new reference with broader assembly source scope:"
     echo ""
     echo "  ${TOOL_NAME}.sh \\"
     echo "      --create \\"
-    echo "      --seed-taxa fungal_seed_taxa.tsv \\"
-    echo "      --exclude-taxa fungal_exclusion_taxa.tsv \\"
-    echo "      --outdir FungiFunk_refdb \\"
+    echo "      --seed-taxa seed_taxa.tsv \\"
+    echo "      --exclude-taxa exclusion_taxa.tsv \\"
+    echo "      --outdir TAURIDAsProt \\"
     echo "      --include-gca"
     echo ""
     echo ""
@@ -1059,8 +1067,8 @@ Help() {
     echo ""
     echo "  ${TOOL_NAME}.sh \\"
     echo "      --create \\"
-    echo "      --seed-taxa fungal_seed_taxa.tsv \\"
-    echo "      --outdir FungiFunk_refdb_depth \\"
+    echo "      --seed-taxa seed_taxa.tsv \\"
+    echo "      --outdir TAURIDAsProt_depth \\"
     echo "      --max-strains-per-species all \\"
     echo "      --include-isolates \\"
     echo "      --include-unassigned-assemblies"
@@ -1070,9 +1078,9 @@ Help() {
     echo ""
     echo "  ${TOOL_NAME}.sh \\"
     echo "      --create \\"
-    echo "      --seed-taxa fungal_seed_taxa.tsv \\"
-    echo "      --exclude-taxa fungal_exclusion_taxa.tsv \\"
-    echo "      --outdir FungiFunk_refdb_custom \\"
+    echo "      --seed-taxa seed_taxa.tsv \\"
+    echo "      --exclude-taxa exclusion_taxa.tsv \\"
+    echo "      --outdir TAURIDAsProt_custom \\"
     echo "      --sequencing-technology-contains illumina \\"
     echo "      --sequencing-technology-contains pacbio \\"
     echo "      --min-contig-n50 50000"
@@ -1082,7 +1090,7 @@ Help() {
     echo ""
     echo "  ${TOOL_NAME}.sh \\"
     echo "      --resume \\"
-    echo "      --outdir FungiFunk_refdb \\"
+    echo "      --outdir TAURIDAsProt \\"
     echo "      --workers 4"
     echo ""
     echo ""
@@ -1090,8 +1098,8 @@ Help() {
     echo ""
     echo "  ${TOOL_NAME}.sh \\"
     echo "      --resume \\"
-    echo "      --outdir FungiFunk_refdb \\"
-    echo "      --seed-taxa corrected_fungal_seed_taxa.tsv \\"
+    echo "      --outdir TAURIDAsProt \\"
+    echo "      --seed-taxa corrected_seed_taxa.tsv \\"
     echo "      --include-gca"
     echo ""
     echo "  Because assembly search has not started, the supplied biological changes are"
@@ -1102,9 +1110,9 @@ Help() {
     echo ""
     echo "  ${TOOL_NAME}.sh \\"
     echo "      --resume \\"
-    echo "      --outdir FungiFunk_refdb \\"
+    echo "      --outdir TAURIDAsProt \\"
     echo "      --reset-biological-config \\"
-    echo "      --seed-taxa corrected_fungal_seed_taxa.tsv"
+    echo "      --seed-taxa corrected_seed_taxa.tsv"
     echo ""
     echo "  The existing build identity and db_version are preserved, while biological"
     echo "  configuration returns to clean defaults before the supplied inputs are"
@@ -1133,19 +1141,19 @@ Help() {
     echo ""
     echo "  ${TOOL_NAME}.sh \\"
     echo "      --create-new-updated-version \\"
-    echo "      --source-refdb FungiFunk_refdb \\"
-    echo "      --outdir FungiFunk_refdb_v2"
+    echo "      --source-refdb TAURIDAsProt \\"
+    echo "      --outdir TAURIDAsProt_v2"
     echo ""
     echo ""
     echo "-> Create a new updated version from clean configuration:"
     echo ""
     echo "  ${TOOL_NAME}.sh \\"
     echo "      --create-new-updated-version \\"
-    echo "      --source-refdb FungiFunk_refdb \\"
-    echo "      --outdir FungiFunk_refdb_v2 \\"
+    echo "      --source-refdb TAURIDAsProt \\"
+    echo "      --outdir TAURIDAsProt_v2 \\"
     echo "      --reset-biological-config \\"
-    echo "      --seed-taxa fungal_seed_taxa.tsv \\"
-    echo "      --exclude-taxa fungal_exclusion_taxa.tsv \\"
+    echo "      --seed-taxa seed_taxa.tsv \\"
+    echo "      --exclude-taxa exclusion_taxa.tsv \\"
     echo "      --include-gca"
     echo ""
     echo ""
@@ -1153,14 +1161,14 @@ Help() {
     echo ""
     echo "  ${TOOL_NAME}.sh \\"
     echo "      --overwrite-with-updated-version \\"
-    echo "      --outdir FungiFunk_refdb"
+    echo "      --outdir TAURIDAsProt"
     echo ""
     echo ""
     echo "-> Retry previously failed NCBI protein downloads in a completed reference:"
     echo ""
-    echo "FungiFunk_refdb.sh \\"
+    echo "TAURIDAsProt.sh \\"
     echo "    --retry-ncbi-failures \\"
-    echo "    --source-refdb FungiFunk_refdb"
+    echo "    --source-refdb TAURIDAsProt"
     echo ""
     echo "Biological configuration and database version are preserved."
     echo "The original reference remains unchanged if no proteins are recovered."
@@ -1169,9 +1177,9 @@ Help() {
     echo "##########################"
     echo "          NOTES           "
     echo "##########################"
-    echo "  FungiFunk_refdb uses NCBI Datasets as the protein-sequence source."
+    echo "  TAURIDAsProt uses NCBI Datasets as the protein-sequence source."
     echo ""
-    echo "  FungiFunk_refdb does not predict proteins that are absent from an NCBI assembly."
+    echo "  TAURIDAsProt does not predict proteins that are absent from an NCBI assembly."
     echo ""
     echo "  Species may remain in the species master even when no usable NCBI protein FASTA"
     echo "  is currently available."
@@ -1191,9 +1199,9 @@ Help() {
     echo "  Custom filters are optional. No numerical N50/BUSCO/genome-size threshold is"
     echo "  imposed unless explicitly requested."
     echo ""
-    echo "  FungiFunk_refdb never intentionally removes unrelated user files."
+    echo "  TAURIDAsProt never intentionally removes unrelated user files."
     echo ""
-    echo "  FungiFunk_refdb also never automatically removes incomplete build directories."
+    echo "  TAURIDAsProt also never automatically removes incomplete build directories."
     echo "  If a run fails before a resumable checkpoint exists, cleanup is deliberately"
     echo "  left to the user before starting again with --create."
     echo ""
@@ -1323,7 +1331,7 @@ prepare_new_target_dir() {
 
                 cat >&2 <<EOF_COMPLETE
 
-[ERROR] A completed FungiFunk_refdb reference already exists in the specified
+[ERROR] A completed TAURIDAsProt reference already exists in the specified
 output directory:
 
     $outdir
@@ -1337,7 +1345,7 @@ To preserve this reference and create an updated copy, use
 To safely replace this completed reference after building and validating an
 updated staging reference, use --overwrite-with-updated-version.
 
-FungiFunk_refdb will not remove or overwrite the completed reference
+TAURIDAsProt will not remove or overwrite the completed reference
 automatically.
 
 EOF_COMPLETE
@@ -1349,7 +1357,7 @@ EOF_COMPLETE
 
                 cat >&2 <<EOF_RESUMABLE
 
-[ERROR] An incomplete but resumable FungiFunk_refdb build already exists in the
+[ERROR] An incomplete but resumable TAURIDAsProt build already exists in the
 specified output directory:
 
     $outdir
@@ -1358,13 +1366,13 @@ ${mode} starts a NEW build and therefore cannot reuse this directory.
 
 Starting again with ${mode} is not necessary. Continue the existing build with:
 
-    FungiFunk_refdb.sh --resume --outdir $outdir
+    TAURIDAsProt.sh --resume --outdir $outdir
 
 Biological configuration may still be editable if assembly
 search and selection has not started. Python will determine this from the
 persistent build state.
 
-FungiFunk_refdb will not remove the existing build automatically.
+TAURIDAsProt will not remove the existing build automatically.
 
 Recovery summary:
   Resumable state available: yes
@@ -1378,12 +1386,12 @@ EOF_RESUMABLE
 
             cat >&2 <<EOF_NOT_RESUMABLE
 
-[ERROR] An incomplete FungiFunk_refdb directory already exists in the specified
+[ERROR] An incomplete TAURIDAsProt directory already exists in the specified
 output location:
 
     $outdir
 
-The previous run stopped before a resumable FungiFunk_refdb state was created.
+The previous run stopped before a resumable TAURIDAsProt state was created.
 
 --resume cannot be used for this run because no persistent recovery checkpoint
 is available yet.
@@ -1391,7 +1399,7 @@ is available yet.
 Correct the problem that stopped the previous run, remove the incomplete output
 directory (or its contents) manually, and start the build again with ${mode}.
 
-FungiFunk_refdb will not remove the incomplete directory automatically.
+TAURIDAsProt will not remove the incomplete directory automatically.
 
 Recovery summary:
   Resumable state available: no
@@ -1407,11 +1415,11 @@ EOF_NOT_RESUMABLE
         cat >&2 <<EOF_UNRELATED
 
 [ERROR] The specified output directory is not empty and does not contain a
-recognized FungiFunk_refdb build/database:
+recognized TAURIDAsProt build/database:
 
     $outdir
 
-FungiFunk_refdb will not modify or remove unrelated user files.
+TAURIDAsProt will not modify or remove unrelated user files.
 
 Please select a new or empty output directory.
 
@@ -1438,11 +1446,11 @@ require_existing_refdb() {
     fi
     if ! is_refdb_dir "$dir"; then
         cat >&2 <<EOF_NOT_REFDB
-[ERROR] ${purpose} is not a recognized FungiFunk_refdb directory:
+[ERROR] ${purpose} is not a recognized TAURIDAsProt directory:
 
     $dir
 
-FungiFunk_refdb will not assume ownership of an unrelated directory.
+TAURIDAsProt will not assume ownership of an unrelated directory.
 EOF_NOT_REFDB
         exit 2
     fi
@@ -1458,7 +1466,7 @@ require_resumable_refdb() {
 
         cat >&2 <<EOF_NOT_RESUMABLE
 
-[ERROR] ${purpose} is a recognized FungiFunk_refdb directory, but the previous
+[ERROR] ${purpose} is a recognized TAURIDAsProt directory, but the previous
 run stopped before a resumable state was created:
 
     $dir
@@ -1469,7 +1477,7 @@ not completed.
 Correct the problem that stopped the previous run, remove the incomplete output
 directory (or its contents) manually, and start the build again with --create.
 
-FungiFunk_refdb will not remove the incomplete directory automatically.
+TAURIDAsProt will not remove the incomplete directory automatically.
 
 Recovery summary:
   Resumable state available: no
@@ -1485,11 +1493,11 @@ EOF_NOT_RESUMABLE
 
 require_completed_refdb_skeleton() {
 
-    # Check the basic filesystem contract of a successfully completed reference.
+    # Check that the essential files of a completed reference exist.
     #
-    # Python performs the authoritative SHA-256 integrity validation. The shell
-    # only requires the files that distinguish a completed reference from an
-    # interrupted/resumable build.
+    # Python performs the full SHA-256 integrity checks.
+    # Bash only checks the files needed to distinguish a completed reference
+    # from an interrupted build that can still be resumed.
     local dir="$1"
     local purpose="$2"
 
@@ -1502,7 +1510,7 @@ require_completed_refdb_skeleton() {
 
         cat >&2 <<EOF_INCOMPLETE
 
-[ERROR] ${purpose} is recognized as FungiFunk_refdb output but does not contain
+[ERROR] ${purpose} is recognized as TAURIDAsProt output but does not contain
 the complete filesystem checkpoint expected from a successfully finalized
 reference:
 
@@ -1738,9 +1746,9 @@ if [[ "$FORCE" == true ]]; then
     fi
 fi
 
-# Biological configuration reset is valid for update modes and for
-# pre-assembly --resume. Python is the state-aware validator
-# for whether a resume is still early enough to change biological settings.
+# Biological settings can be reset during updates or early resume.
+# Python checks the saved build progress to determine whether
+# a resumed run is still early enough to allow these changes.
 if [[ "$RESET_BIOLOGICAL_CONFIG" == true &&
       "$RUN_MODE" != "create-new-updated-version" &&
       "$RUN_MODE" != "overwrite-with-updated-version" &&
@@ -1769,8 +1777,8 @@ if [[ ! -f "$PYTHON_SCRIPT" || ! -r "$PYTHON_SCRIPT" ]]; then
     exit 2
 fi
 
-# Canonical paths are used only for safety comparisons/logging; the original
-# user arguments are still forwarded unchanged to Python.
+# Use normalized paths to compare directories safely and record their locations.
+# Pass the user's original arguments to Python without changing them.
 OUTDIR_CANON="$(canonicalize_path "$OUTDIR")"
 SOURCE_REFDB_CANON=""
 if [[ -n "$SOURCE_REFDB" ]]; then
@@ -1879,8 +1887,8 @@ case "$RUN_MODE" in
         recovery_parent="$(dirname -- "$SOURCE_REFDB_CANON")"
         recovery_name="$(basename -- "$SOURCE_REFDB_CANON")"
 
-        recovery_staging="${recovery_parent}/.${recovery_name}.FungiFunk_refdb_recovery_staging"
-        recovery_backup="${recovery_parent}/.${recovery_name}.FungiFunk_refdb_previous_backup"
+        recovery_staging="${recovery_parent}/.${recovery_name}.TAURIDAsProt_recovery_staging"
+        recovery_backup="${recovery_parent}/.${recovery_name}.TAURIDAsProt_previous_backup"
 
         if [[ -e "$recovery_staging" || -L "$recovery_staging" ]]; then
             log_msg "[ERROR] A previous manual NCBI recovery staging path already exists:" >&2
@@ -1894,7 +1902,7 @@ case "$RUN_MODE" in
             log_msg "[ERROR] A previous safe-overwrite backup exists:" >&2
             log_msg "        $recovery_backup" >&2
             log_msg "        Inspect this backup before starting manual NCBI recovery." >&2
-            log_msg "        FungiFunk_refdb will not delete it automatically." >&2
+            log_msg "        TAURIDAsProt will not delete it automatically." >&2
             exit 2
         fi
         ;;
@@ -1918,8 +1926,8 @@ if [[ -n "$TMPDIR_ARG" ]]; then
     fi
 fi
 
-# Detect whether --resume is operating on the deterministic staging directory
-# created by a previous --overwrite-with-updated-version invocation.
+# Check whether --resume is continuing the temporary directory
+# created by an earlier --overwrite-with-updated-version run.
 RESUMING_OVERWRITE="false"
 RESUMED_OVERWRITE_TARGET=""
 
@@ -1930,12 +1938,12 @@ if [[ "$RUN_MODE" == "resume" ]]; then
 
     if [[ -f "${OUTDIR_CANON}/${REFDB_MARKER_REL}" &&
           "$resume_dir_name" == .* &&
-          "$resume_dir_name" == *".FungiFunk_refdb_update_staging" ]]; then
+          "$resume_dir_name" == *".TAURIDAsProt_update_staging" ]]; then
 
         # Remove the leading dot and the fixed staging suffix to reconstruct the
         # original reference directory name.
         resume_target_name="${resume_dir_name#.}"
-        resume_target_name="${resume_target_name%.FungiFunk_refdb_update_staging}"
+        resume_target_name="${resume_target_name%.TAURIDAsProt_update_staging}"
 
         if [[ -n "$resume_target_name" ]]; then
 
@@ -1963,7 +1971,7 @@ if [[ "$RUN_MODE" == "overwrite-with-updated-version" ||
     overwrite_parent="$(dirname -- "$OUTDIR_CANON")"
     overwrite_name="$(basename -- "$OUTDIR_CANON")"
 
-    run_info_log="$(mktemp "${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_wrapper.XXXXXX")"
+    run_info_log="$(mktemp "${overwrite_parent}/.${overwrite_name}.TAURIDAsProt_wrapper.XXXXXX")"
 
 else
 
@@ -2076,9 +2084,9 @@ finish_console_capture() {
         reference_name="$(basename -- "$OUTDIR_CANON")"
 
         if [[ "$RUN_MODE" == "retry-ncbi-failures" ]]; then
-            staging_dir="${parent_dir}/.${reference_name}.FungiFunk_refdb_recovery_staging"
+            staging_dir="${parent_dir}/.${reference_name}.TAURIDAsProt_recovery_staging"
         else
-            staging_dir="${parent_dir}/.${reference_name}.FungiFunk_refdb_update_staging"
+            staging_dir="${parent_dir}/.${reference_name}.TAURIDAsProt_update_staging"
         fi
 
         if [[ "$run_status" -eq 0 &&
@@ -2091,7 +2099,7 @@ finish_console_capture() {
         else
             # Keep failed or no-change logs outside the original reference.
             target_dir="$parent_dir"
-            target_name=".${reference_name}.FungiFunk_refdb_${CONSOLE_LOG_NAME}"
+            target_name=".${reference_name}.TAURIDAsProt_${CONSOLE_LOG_NAME}"
         fi
 
     elif [[ "$RUN_MODE" == "resume" &&
@@ -2116,8 +2124,8 @@ finish_console_capture() {
     fi
 }
 
-# Use a named pipe so the logging process can be waited for safely.
-# Keep the logging process alive when the user presses Ctrl+C.
+# Use a named pipe to capture console output and wait for logging to finish.
+# Keep capturing output even if the user interrupts the run with Ctrl+C.
 CONSOLE_PIPE="${CONSOLE_PART}.pipe"
 mkfifo -- "$CONSOLE_PIPE"
 
@@ -2142,12 +2150,11 @@ trap 'log_msg "[WARNING] Run terminated (SIGTERM)."; exit 143' TERM
 # Print run start messages
 ########################################################################################################
 echo "###################################################################################################"
-echo " _____                  _ _____            _                  __     _ _          "
-echo "|  ___|   _ _ __   __ _(_)  ___|   _ _ __ | | __    _ __ ___ / _| __| | |__       "
-echo "| |_ | | | |  _ \ / _  | | |_ | | | |  _ \| |/ /   |  __/ _ \ |_ / _  | '_ \      "
-echo "|  _|| |_| | | | | (_| | |  _|| |_| | | | |   <    | | |  __/  _| (_| | |_) |     "
-echo "|_|   \__,_|_| |_|\__, |_|_|   \__,_|_| |_|_|\_\___|_|  \___|_|  \__,_|_.__/      "
-echo "                  |___/                                                           "
+echo " _____  _   _   _ ____  ___ ____    _        ____            _   "
+echo "|_   _|/ \ | | | |  _ \|_ _|  _ \  / \   ___|  _ \ _ __ ___ | |_ "
+echo "  | | / _ \| | | | |_) || || | | |/ _ \ / __| |_) | '__/ _ \| __|"
+echo "  | |/ ___ \ |_| |  _ < | || |_| / ___ \\\\__ \  __/| | | (_) | |_ "
+echo "  |_/_/   \_\___/|_| \_\___|____/_/   \_\___/_|   |_|  \___/ \__|"
 echo ""
 echo "Running ${TOOL_NAME} ${VERSION}"
 echo "Run mode: ${RUN_MODE}"
@@ -2183,15 +2190,15 @@ echo ""
 # Temporarily disable 'set -e' so the wrapper can continue if Python fails.
 set +e
 
-FUNGIFUNK_WRAPPER_RUN_INFO_LOG="$run_info_log" \
-FUNGIFUNK_CONSOLE_LOG_NAME="$CONSOLE_LOG_NAME" \
+TAURIDASPROT_WRAPPER_RUN_INFO_LOG="$run_info_log" \
+TAURIDASPROT_CONSOLE_LOG_NAME="$CONSOLE_LOG_NAME" \
     PYTHONUNBUFFERED=1 python3 "$PYTHON_SCRIPT" "${ORIGINAL_ARGS[@]}"
 
 PYTHON_STATUS=$?
 set -e
 
-# Manual recovery can complete successfully without publishing changes.
-# Require an unambiguous receipt from the Python process.
+# A manual recovery run may finish successfully without changing the reference.
+# Require Python to report clearly whether any changes were published.
 RECOVERY_ACTION=""
 
 if [[ "$RUN_MODE" == "retry-ncbi-failures" &&
@@ -2242,9 +2249,9 @@ if [[ "$RUN_MODE" == "overwrite-with-updated-version" ||
 
     # Keep staging names consistent with the Python implementation.
     if [[ "$RUN_MODE" == "retry-ncbi-failures" ]]; then
-        staging_dir="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_recovery_staging"
+        staging_dir="${overwrite_parent}/.${overwrite_name}.TAURIDAsProt_recovery_staging"
     else
-        staging_dir="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_update_staging"
+        staging_dir="${overwrite_parent}/.${overwrite_name}.TAURIDAsProt_update_staging"
     fi
 
     if [[ "$PYTHON_STATUS" -eq 0 &&
@@ -2253,7 +2260,7 @@ if [[ "$RUN_MODE" == "overwrite-with-updated-version" ||
 
         # Python completed without publishing anything. Do not write logs
         # into the unchanged original reference.
-        unchanged_run_info_log="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_recovery_no_changes.log"
+        unchanged_run_info_log="${overwrite_parent}/.${overwrite_name}.TAURIDAsProt_recovery_no_changes.log"
 
         if cat -- "$run_info_log" >> "$unchanged_run_info_log"; then
 
@@ -2321,9 +2328,9 @@ if [[ "$RUN_MODE" == "overwrite-with-updated-version" ||
         # Keep the failure log beside the reference rather than writing anything
         # inside the still-valid original database.
         if [[ "$RUN_MODE" == "retry-ncbi-failures" ]]; then
-            failed_run_info_log="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_recovery_failed.log"
+            failed_run_info_log="${overwrite_parent}/.${overwrite_name}.TAURIDAsProt_recovery_failed.log"
         else
-            failed_run_info_log="${overwrite_parent}/.${overwrite_name}.FungiFunk_refdb_update_failed.log"
+            failed_run_info_log="${overwrite_parent}/.${overwrite_name}.TAURIDAsProt_update_failed.log"
         fi
 
         if cat -- "$run_info_log" >> "$failed_run_info_log"; then

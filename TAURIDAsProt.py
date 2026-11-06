@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FungiFunk_refdb.py
+TAURIDAsProt.py
 """
 
 from __future__ import annotations
@@ -45,9 +45,9 @@ except ImportError:
 # Global constants and default settings
 ########################################################################################################
 
-TOOL_NAME = "FungiFunk_refdb"
-VERSION = "0.5.0"
-FINAL_FASTA_NAME = "FungiFunk_protein_refdb.faa"
+TOOL_NAME = "TAURIDAsProt"
+VERSION = "0.6.0"
+FINAL_FASTA_NAME = "TAURIDAsProt_protein_refdb.faa"
 
 ESTIMATED_RAM_GIB_PER_WORKER = 1.0
 ESTIMATED_TMP_GIB_PER_WORKER = 2.0
@@ -97,16 +97,16 @@ CONFIG_DIR = "config"
 LOGS_DIR = "logs"
 STATE_DIR = "state"
 TMP_DIR = "tmp"
-MARKER_REL = Path(STATE_DIR) / ".fungifunk_refdb"
+MARKER_REL = Path(STATE_DIR) / ".tauridasprot"
 STATE_DB_REL = Path(STATE_DIR) / "build_state.sqlite"
-RESUME_READY_REL = Path(STATE_DIR) / ".fungifunk_refdb_resume_ready.json"
+RESUME_READY_REL = Path(STATE_DIR) / ".tauridasprot_resume_ready.json"
 MANIFEST_REL = Path(STATE_DIR) / "build_manifest.tsv"
-COMPLETION_MARKER_REL = (Path(STATE_DIR) / ".fungifunk_refdb_complete.json")
+COMPLETION_MARKER_REL = (Path(STATE_DIR) / ".tauridasprot_complete.json")
 CANONICAL_STORE_REL = Path(STATE_DIR) / "canonical_sequences.bin"
 CONFIG_JSON_REL = Path(STATE_DIR) / "resolved_config.json"
 
-SEED_SNAPSHOT = "fungal_seed_taxa.tsv"
-EXCLUSION_SNAPSHOT = "fungal_exclusion_taxa.tsv"
+SEED_SNAPSHOT = "seed_taxa.tsv"
+EXCLUSION_SNAPSHOT = "exclusion_taxa.tsv"
 FILTER_SNAPSHOT = "metadata_filters.tsv"
 INCLUDE_EXPLICIT_TARGETS_SNAPSHOT = "include_explicit_targets.tsv"
 EXCLUDE_EXPLICIT_TARGETS_SNAPSHOT = "exclude_explicit_targets.tsv"
@@ -137,17 +137,17 @@ EXIT_INTERNAL = 70
 # Exceptions
 ########################################################################################################
 
-class FungiFunkError(RuntimeError):
+class TAURIDAsProtError(RuntimeError):
     """Base class for expected, user-readable failures."""
 
     exit_code = EXIT_INTERNAL
 
 
-class ConfigError(FungiFunkError):
+class ConfigError(TAURIDAsProtError):
     exit_code = EXIT_CONFIG
 
 
-class CurationConflict(FungiFunkError):
+class CurationConflict(TAURIDAsProtError):
     """A biological curation conflict that may be fixed and resumed safely."""
 
     exit_code = EXIT_CURATION_WAIT
@@ -157,25 +157,23 @@ class CurationConflict(FungiFunkError):
         self.conflicts = conflicts or []
 
 
-class ResourceSafetyError(FungiFunkError):
+class ResourceSafetyError(TAURIDAsProtError):
     exit_code = EXIT_RESOURCE
 
 
-class ExternalToolError(FungiFunkError):
+class ExternalToolError(TAURIDAsProtError):
     exit_code = EXIT_EXTERNAL
 
 
 class NCBIRequestError(ExternalToolError):
-    """An NCBI Datasets request failed after the configured retries.
+    """Describe an NCBI request that still failed after all retries.
 
-    ``reason`` is a stable machine-readable category that can be propagated
-    through worker results and final reports.
+    ``reason`` stores a consistent failure category used in worker results
+    and reports. ``detail`` keeps the command and error information needed
+    to investigate what happened.
 
-    ``detail`` preserves the human-readable command/error information needed
-    for diagnostics.
-
-    This exception describes a retrieval failure. It must not be interpreted
-    as evidence that the requested biological data do not exist.
+    A failed request does not mean that the requested biological data
+    are unavailable. NCBI may simply have failed to return them.
     """
 
     def __init__(
@@ -197,17 +195,16 @@ class NCBIRequestError(ExternalToolError):
         self.returncode = returncode
 
 
-class DataIntegrityError(FungiFunkError):
+class DataIntegrityError(TAURIDAsProtError):
     exit_code = EXIT_INTEGRITY
 
 
 class HashCollisionError(DataIntegrityError):
-    """A cryptographic hash matched but the full canonical sequences differed.
+    """Stop the build if different protein sequences have the same SHA-256 hash.
 
-    This is deliberately a separate fatal error. Ordinary corrupt/missing
-    assembly packages may be excluded and reported, but a SHA-256 collision in
-    our canonical sequence index would invalidate the deduplication invariant and
-    must stop the entire build for manual integrity review.
+    An incomplete or damaged assembly download can be reported and skipped,
+    but a hash collision would make exact deduplication unreliable.
+    The entire build must therefore stop for manual investigation.
     """
 
 
@@ -415,7 +412,7 @@ def report_recovery_guidance(
     if root is None:
         return
 
-    # If FungiFunk never initialized this directory, there is no persistent
+    # If TAURIDAsProt never initialized this directory, there is no persistent
     # build recovery state to explain.
     if not (root / MARKER_REL).is_file():
         return
@@ -432,13 +429,13 @@ def report_recovery_guidance(
     )
 
     # --------------------------------------------------------------
-    # Recognized FungiFunk directory, but initialization stopped too
+    # Recognized TAURIDAsProt directory, but initialization stopped too
     # early to create a safe resume checkpoint.
     # --------------------------------------------------------------
     if not resume_ready:
 
         console_print(
-            "This run stopped before a resumable FungiFunk_refdb state "
+            "This run stopped before a resumable TAURIDAsProt state "
             "was created.",
             file=sys.stderr,
         )
@@ -466,7 +463,7 @@ def report_recovery_guidance(
             file=sys.stderr,
         )
         console_print(
-            "FungiFunk_refdb will not remove the incomplete directory "
+            "TAURIDAsProt will not remove the incomplete directory "
             "automatically.",
             file=sys.stderr,
         )
@@ -553,7 +550,7 @@ def report_recovery_guidance(
         try:
             verify_completed_reference(root)
 
-        except FungiFunkError:
+        except TAURIDAsProtError:
 
             console_print(
                 "A final completion marker exists, but the completed-reference "
@@ -610,7 +607,7 @@ def report_recovery_guidance(
                 file=sys.stderr,
             )
             console_print(
-                f"  FungiFunk_refdb.sh --resume --outdir {root}",
+                f"  TAURIDAsProt.sh --resume --outdir {root}",
                 file=sys.stderr,
             )
             console_print(
@@ -715,7 +712,7 @@ def report_recovery_guidance(
             file=sys.stderr,
         )
         console_print(
-            "It determines which fungal taxa and genome assemblies can "
+            "It determines which taxa and genome assemblies can "
             "contribute proteins to the reference database. For the complete "
             "option list, see BIOLOGICAL CONFIGURATION in --help.",
             file=sys.stderr,
@@ -743,7 +740,7 @@ def report_recovery_guidance(
             file=sys.stderr,
         )
         console_print(
-            "If biological configuration changes, FungiFunk_refdb clears any "
+            "If biological configuration changes, TAURIDAsProt clears any "
             "existing pre-assembly curation and rebuilds TAXONOMY_CURATION "
             "from the beginning. No assembly/protein processing is lost.",
             file=sys.stderr,
@@ -766,7 +763,7 @@ def report_recovery_guidance(
             file=sys.stderr,
         )
         console_print(
-            f"  FungiFunk_refdb.sh --resume --outdir {root}",
+            f"  TAURIDAsProt.sh --resume --outdir {root}",
             file=sys.stderr,
         )
         console_print(
@@ -862,7 +859,7 @@ def report_recovery_guidance(
         file=sys.stderr,
     )
     console_print(
-        f"  FungiFunk_refdb.sh --resume --outdir {root}",
+        f"  TAURIDAsProt.sh --resume --outdir {root}",
         file=sys.stderr,
     )
     console_print(
@@ -926,7 +923,7 @@ def fsync_file(handle: Any) -> None:
 
 
 def fsync_dir(path: Path) -> None:
-    """Best-effort directory fsync so preceding renames survive a hard crash."""
+    """Try to save directory changes to disk to reduce data loss after a crash."""
     if os.name == "nt":
         return
     try:
@@ -1142,7 +1139,7 @@ def write_xlsx_from_tsv(tsv_path: Path, xlsx_path: Path) -> None:
     wb = Workbook(write_only=True)
 
     # Create the worksheet that will contain the TSV data.
-    ws = wb.create_sheet(title="FungiFunk")
+    ws = wb.create_sheet(title="TAURIDAsProt")
 
     # Copy every TSV row directly into the XLSX worksheet.
     with tsv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -1168,17 +1165,13 @@ def read_commentable_tsv(
     *,
     allow_no_data_rows: bool = False,
 ) -> list[dict[str, str]]:
-    """Read a TSV allowing blank lines and comments beginning with '#'.
+    """Read a TSV file that may contain blank lines and # comments.
 
-    By default, a valid header and at least one active data row are required.
+    Normally, require a valid header and at least one data row.
+    If allow_no_data_rows=True, empty files and files without active
+    data rows are accepted and return an empty list.
 
-    Callers whose semantics allow an empty rule set may set
-    allow_no_data_rows=True. In that mode, a completely empty file, a file
-    containing only blank/comment lines, or a valid header with no active data
-    rows returns an empty list.
-
-    Non-empty malformed files are still rejected rather than silently treated
-    as empty.
+    Files with invalid content are still rejected.
     """
 
     if not path.is_file():
@@ -1513,9 +1506,10 @@ CURATION_COMMITTED_STATES = {
 }
 
 
-# A completed assembly-search/selection phase may be reused directly.
-# The in-progress state is deliberately absent because a partial assembly
-# search/selection is rebuilt from scratch before protein processing resumes.
+# A completed assembly search can be reused without repeating it.
+# If the search was interrupted, resume keeps the results of species
+# with completed checkpoints and searches only the unfinished species.
+# An incomplete inventory without checkpoints is rebuilt for safety.
 ASSEMBLY_SELECTION_COMMITTED_STATES = {
     "ASSEMBLY_SEARCH_AND_SELECTION_COMPLETE",
     "UPDATE_COMPARISON_AND_SELECTION",
@@ -1600,9 +1594,9 @@ def positive_int_or_all(value: str) -> int | str:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=TOOL_NAME,
-        description="Authoritative Python implementation for FungiFunk_refdb.",
+        description="Authoritative Python implementation for TAURIDAsProt.",
     )
-    p.add_argument("--version", action="version", version=f"{TOOL_NAME} v{VERSION}", help="Show FungiFunk_refdb version and exit.",)
+    p.add_argument("--version", action="version", version=f"{TOOL_NAME} v{VERSION}", help="Show TAURIDAsProt version and exit.",)
 
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--create", action="store_true")
@@ -1874,7 +1868,7 @@ def save_json_atomic(path: Path, obj: Mapping[str, Any]) -> None:
 def write_resume_ready_marker(work_root: Path) -> None:
     """Record that this build has enough persistent state for safe --resume.
 
-    The ordinary FungiFunk_refdb ownership marker only identifies the directory
+    The ordinary TAURIDAsProt ownership marker only identifies the directory
     as belonging to this tool. It does not guarantee that initialization
     progressed far enough for recovery.
 
@@ -1938,7 +1932,7 @@ def verify_completed_reference(root: Path) -> None:
 
     if not marker.is_file():
         raise DataIntegrityError(
-            "Reference does not have the final FungiFunk_refdb completion "
+            "Reference does not have the final TAURIDAsProt completion "
             f"marker: {marker}"
         )
 
@@ -1948,7 +1942,7 @@ def verify_completed_reference(root: Path) -> None:
         )
     except (OSError, json.JSONDecodeError) as exc:
         raise DataIntegrityError(
-            f"Invalid FungiFunk_refdb completion marker: {marker}"
+            f"Invalid TAURIDAsProt completion marker: {marker}"
         ) from exc
 
     if payload.get("tool") != TOOL_NAME:
@@ -1999,7 +1993,7 @@ def namespace_explicit_values(ns: argparse.Namespace) -> dict[str, Any]:
 
 
 def resolve_config(ns: argparse.Namespace) -> BuildConfig:
-    """Resolve create/resume/update inheritance into one authoritative config."""
+    """Combine defaults, saved settings and user options for CREATE, RESUME or UPDATE."""
 
     run_mode = detect_run_mode(ns)
 
@@ -2595,11 +2589,11 @@ CREATE TABLE IF NOT EXISTS update_changes (
 
 
 class StateDB:
-    """Coordinator-owned SQLite database.
+    """Store build progress in SQLite, managed only by the main process.
 
-    Workers NEVER receive this connection. That rule is more important than
-    squeezing a little extra throughput from concurrent SQLite writes: it makes
-    recovery semantics understandable and avoids partial shared commits.
+    Worker processes must never share this database connection.
+    Keeping their database writes separate prevents conflicting changes
+    and makes interrupted builds easier to recover safely.
     """
 
     def __init__(self, path: Path):
@@ -2613,12 +2607,11 @@ class StateDB:
         self.conn.commit()
 
     def checkpoint(self, *, truncate: bool = True) -> None:
-        """Flush WAL content into the main SQLite file before external hashing/copying.
+        """Move saved SQLite changes into the main database file.
 
-        SQLite transactions make database changes atomic, but a completed WAL-mode
-        database can still have committed pages in the separate -wal file. Our
-        build manifest intentionally hashes stable final files, so finalization
-        checkpoints the WAL before computing checksums.
+        SQLite may keep committed changes in a separate -wal file.
+        Move these changes into the main database before copying it
+        or calculating file checksums, so the saved reference includes them.
         """
         self.conn.commit()
         mode = "TRUNCATE" if truncate else "PASSIVE"
@@ -2703,7 +2696,7 @@ class StateDB:
         return str(self.get_meta("global_state", "UNKNOWN"))
 
     def clear_preassembly_data(self) -> None:
-        """Safe only before assembly processing; used after curation fix."""
+        """Clear earlier results after curation corrections, before assembly processing starts."""
         with self.conn:
             for table in [
                 "assembly_inventory_completed",
@@ -2715,7 +2708,7 @@ class StateDB:
 
 
 def append_python_log(root: Path, message: str) -> None:
-    path = root / LOGS_DIR / "FungiFunk_refdb.python.log"
+    path = root / LOGS_DIR / "TAURIDAsProt.python.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(f"{now_iso()}\t{message}\n")
@@ -2738,7 +2731,7 @@ def update_wrapper_run_info_db_version(
     written the resolved value. In that case this helper is a no-op.
 
     The wrapper passes the current log path through an internal environment
-    variable. Direct invocation of FungiFunk_refdb.py does not set that
+    variable. Direct invocation of TAURIDAsProt.py does not set that
     variable, so this helper becomes a no-op.
 
     Failure to update this presentation/provenance log must never invalidate
@@ -2746,7 +2739,7 @@ def update_wrapper_run_info_db_version(
     """
 
     log_path_raw = os.environ.get(
-        "FUNGIFUNK_WRAPPER_RUN_INFO_LOG"
+        "TAURIDASPROT_WRAPPER_RUN_INFO_LOG"
     )
 
     if not log_path_raw or not db_version:
@@ -2870,13 +2863,13 @@ def _wrapper_log_value(
 def _append_wrapper_run_info_lines(lines: list[str]) -> None:
     """Append human-readable information to the current wrapper log.
 
-    Direct Python invocation does not define FUNGIFUNK_WRAPPER_RUN_INFO_LOG,
+    Direct Python invocation does not define TAURIDASPROT_WRAPPER_RUN_INFO_LOG,
     so this helper becomes a no-op. Logging failure must not invalidate an
     otherwise valid reference build.
     """
 
     log_path_raw = os.environ.get(
-        "FUNGIFUNK_WRAPPER_RUN_INFO_LOG"
+        "TAURIDASPROT_WRAPPER_RUN_INFO_LOG"
     )
 
     if not log_path_raw:
@@ -3066,7 +3059,7 @@ def append_wrapper_command_and_inherited_biological_config(
     work_root: Path,
     source_root: Path | None,
 ) -> None:
-    """Log explicit CLI biology and the biological configuration used as base."""
+    """Log the user's biological options and any settings inherited from a reference."""
 
     lines = [
         "Biological options supplied in this command:",
@@ -3943,7 +3936,7 @@ def classify_ncbi_request_failure(
     stdout = (result.stdout or "").lower()
     combined = f"{stderr}\n{stdout}"
 
-    # FungiFunk itself uses return code 124 when subprocess.run() exceeds the
+    # TAURIDAsProt itself uses return code 124 when subprocess.run() exceeds the
     # configured timeout. Also recognize explicit timeout wording emitted by
     # the external command.
     if (
@@ -4098,7 +4091,7 @@ def run_ncbi_command(
             except subprocess.TimeoutExpired as exc:
                 # Convert a Python subprocess timeout into the same result
                 # structure used for ordinary external-command failures.
-                # Return code 124 is FungiFunk's explicit timeout marker.
+                # Return code 124 is TAURIDAsProt's explicit timeout marker.
                 result = subprocess.CompletedProcess(
                     list(cmd),
                     124,
@@ -4212,9 +4205,9 @@ def parse_json_records(text: str) -> list[dict[str, Any]]:
     if not text:
         return []
     records: list[dict[str, Any]] = []
-    # --as-json-lines normally emits one JSON object per lineThis fallback
-    # also accepts a regular JSON object/array so minor CLI presentation changes
-    # do not immediately break FungiFunk.
+    # --as-json-lines normally returns one JSON object per line.
+    # Also accept a regular JSON object or array in case the NCBI output
+    # format changes slightly between versions.
     try:
         whole = json.loads(text)
     except json.JSONDecodeError:
@@ -4827,7 +4820,7 @@ def build_curated_species(
 
     if conflicts:
         raise CurationConflict(
-            "Unresolved equal-priority Tier assignments were found in fungal_seed_taxa.tsv.",
+            "Unresolved equal-priority Tier assignments were found in seed_taxa.tsv.",
             conflicts,
         )
 
@@ -4883,9 +4876,9 @@ def build_curated_species(
         explicit_targets_by_species
     )
 
-    # Build exclusion-match map only for candidate species. We deliberately do
-    # not treat "uncertain" morphology as an exclusion: only explicit taxonomy
-    # rules supplied by the curator can remove a species.
+    # Check taxonomic exclusions only against candidate species.
+    # At this stage, only explicit exclusion rules supplied by the user
+    # can remove a species. No additional exclusions are inferred.
     exclusion_matches: dict[int, list[ResolvedTaxonRule]] = defaultdict(list)
     for rule in exclusion_rules:
         info(f"Expanding exclusion taxon {rule.name} (TaxID {rule.taxid}, rank={rule.rank})")
@@ -5753,7 +5746,7 @@ def as_float_or_none(value: Any) -> float | None:
 def busco_percent(value: Any) -> float | None:
     """NCBI BUSCO report currently stores fractions (e.g. 0.9887).
 
-    FungiFunk's public CLI is deliberately percentage-based (e.g. 90 means 90%).
+    TAURIDAsProt's public CLI is deliberately percentage-based (e.g. 90 means 90%).
     We normalize values <=1 to percent while tolerating a future/report variant
     that already supplies 0-100 values.
     """
@@ -6936,7 +6929,7 @@ def save_resolved_explicit_targets(
     path: Path,
     targets: Sequence[ResolvedExplicitTarget],
 ) -> None:
-    """Persist canonical target resolution for deterministic resume."""
+    """Save resolved target identities so resumed runs use exactly the same targets."""
 
     save_json_atomic(
         path,
@@ -6958,7 +6951,7 @@ def load_resolved_explicit_targets(
     path: Path,
     expected_rules: Sequence[ExplicitTargetRule],
 ) -> list[ResolvedExplicitTarget]:
-    """Reload previously committed canonical explicit-target resolution."""
+    """Reload the target identities saved earlier in this build."""
 
     expected = list(
         expected_rules
@@ -10571,7 +10564,7 @@ def process_species_worker(job: WorkerJob) -> WorkerResult:
             raise
 
         except (
-            FungiFunkError,
+            TAURIDAsProtError,
             UnicodeError,
             OSError,
             zipfile.BadZipFile,
@@ -10939,7 +10932,7 @@ def import_species_worker_result(
                     )
 
             for row in local.execute("SELECT * FROM sources"):
-                source_id = f"FFSRC_{row['sequence_sha256']}"
+                source_id = f"TASPSRC_{row['sequence_sha256']}"
                 state.conn.execute(
                     """INSERT INTO sources(sequence_sha256,sequence_length,source_id,species_taxid,species,tier,assembly,
                            assembly_source,paired_accession,strain,isolate,original_protein_accession,original_header,
@@ -11039,7 +11032,7 @@ def recover_ready_species(state: StateDB, species: SpeciesCandidate, assemblies:
         import_species_worker_result(state, result, {a.accession: a for a in assemblies})
         info(f"Recovered validated prepared species from previous interrupted run: {species.species}")
         return True
-    except FungiFunkError as exc:
+    except TAURIDAsProtError as exc:
         warn(f"Discarding invalid stale .ready product for {species.species}: {exc}")
         fasta_ready.unlink(missing_ok=True)
         sources_ready.unlink(missing_ok=True)
@@ -11197,7 +11190,7 @@ def recover_ncbi_recovery_ready_species(
         return recovery_accessions
 
     except (
-        FungiFunkError,
+        TAURIDAsProtError,
         sqlite3.Error,
         OSError,
     ) as exc:
@@ -11787,7 +11780,7 @@ def write_resource_usage(path: Path, plan: ResourcePlan, config: BuildConfig) ->
 ########################################################################################################
 
 class OldReference:
-    """Read-only view of a completed source FungiFunk_refdb."""
+    """Read-only view of a completed source TAURIDAsProt."""
 
     def __init__(
         self,
@@ -12092,7 +12085,7 @@ def reconcile_final_assembly_update_changes(
     """Rebuild assembly-level update changes from the final reference selection.
 
     The initial update classification is deliberately provisional. It is needed
-    before protein processing so FungiFunk can decide which assemblies may be
+    before protein processing so TAURIDAsProt can decide which assemblies may be
     reused and which assemblies need new protein retrieval.
 
     After protein availability and -configured biological assembly-selection have been
@@ -12661,7 +12654,7 @@ def run_species_workers(
                 job = future_map[future]
                 try:
                     result = future.result()
-                except FungiFunkError:
+                except TAURIDAsProtError:
                     for other in future_map:
                         other.cancel()
                     raise
@@ -12934,7 +12927,7 @@ def run_species_workers(
                     try:
                         recovery_result = future.result()
 
-                    except FungiFunkError:
+                    except TAURIDAsProtError:
                         for other in recovery_future_map:
                             other.cancel()
                         raise
@@ -13995,22 +13988,23 @@ def canonical_store_insert_or_verify(state: StateDB, store: Any, digest: str, se
         store.write(sequence.encode("ascii"))
         state.conn.execute(
             "INSERT INTO canonical_sequences(sequence_sha256,sequence_length,store_offset,source_id) VALUES(?,?,?,?)",
-            (digest,len(sequence),offset,f"FFSRC_{digest}"),
+            (digest,len(sequence),offset,f"TASPSRC_{digest}"),
         )
         return
     existing = read_sequence_from_store(store, int(row["store_offset"]), int(row["sequence_length"]))
     if existing != sequence:
         raise HashCollisionError(
             f"SHA-256 collision detected during global exact deduplication for {digest}. "
-            "FungiFunk will not collapse unequal sequences."
+            "TAURIDAsProt will not collapse unequal sequences."
         )
 
 
 def rebuild_global_canonical_store(state: StateDB, work_root: Path, old: OldReference | None) -> None:
-    """Build disk-backed global unique sequence store from selected provenance.
+    """Build the final collection of unique protein sequences on disk.
 
-    We never load all protein hashes/sequences into RAM. Membership is queried
-    through SQLite and sequence bytes live in an append-only canonical file.
+    Only proteins from selected assemblies are included.
+    SQLite tracks which sequences are already present, while the actual
+    sequences are stored in a separate file to avoid using excessive RAM.
     """
     ready_dirs = (
         work_root / TMP_DIR / "prepared_species",
@@ -14147,7 +14141,7 @@ def header_and_metadata_for_hash(state: StateDB, digest: str, length: int) -> tu
     else:
         species_token = "MULTI_SPECIES"
     protein_token = protein_values[0] if len(protein_values) == 1 else "NONUNIQUE"
-    source_id = f"FFSRC_{digest}"
+    source_id = f"TASPSRC_{digest}"
     first_token = f"{assembly_token}|{species_token}|{protein_token}|src={source_id}"
 
     nonunique = assembly_token == "NONUNIQUE" or species_token == "MULTI_SPECIES" or protein_token == "NONUNIQUE"
@@ -14198,7 +14192,7 @@ def write_final_fasta_and_protein_metadata(
     fasta_final = work_root / DATABASE_DIR / FINAL_FASTA_NAME
     fasta_part = fasta_final.with_name(fasta_final.name + ".part")
 
-    meta_final = work_root / METADATA_DIR / "fungal_protein_metadata.tsv"
+    meta_final = work_root / METADATA_DIR / "protein_metadata.tsv"
     meta_part = meta_final.with_name(meta_final.name + ".part")
 
     fasta_final.parent.mkdir(parents=True, exist_ok=True)
@@ -14324,15 +14318,16 @@ def write_protein_sources(
     work_root: Path,
 ) -> None:
     """
-    Write the provenance records of the final protein reference.
+    Export the original sources of every protein in the final reference.
 
-    Each source occurrence receives one TSV row.
+    Write one TSV row for each original protein occurrence, including
+    multiple occurrences of an identical sequence.
 
-    The original SQL ordering, output columns and atomic replacement
-    are preserved. Progress reports only add console/log messages.
+    Keep the established row and column order, and finish writing the
+    temporary file before replacing the final output.
     """
 
-    path = work_root / METADATA_DIR / "fungal_protein_sources.tsv"
+    path = work_root / METADATA_DIR / "protein_sources.tsv"
     part = path.with_name(path.name + ".part")
 
     fields = [
@@ -14454,7 +14449,7 @@ def write_grouped_protein_sources(
     """Write grouped, compressed YAML provenance for the final reference."""
     import gzip
 
-    path = work_root / METADATA_DIR / "fungal_protein_sources.yaml.gz"
+    path = work_root / METADATA_DIR / "protein_sources.yaml.gz"
     part = path.with_name(path.name + ".part")
 
     total_sources = int(
@@ -14614,9 +14609,9 @@ def validate_final_reference(state: StateDB, work_root: Path) -> None:
             )
         token = rec.header.split(None, 1)[0]
         parts = token.split("|")
-        if len(parts) != 4 or not parts[3].startswith("src=FFSRC_"):
+        if len(parts) != 4 or not parts[3].startswith("src=TASPSRC_"):
             raise DataIntegrityError(f"Final FASTA header does not follow the four-field contract: {token}")
-        if parts[3] != f"src=FFSRC_{digest}":
+        if parts[3] != f"src=TASPSRC_{digest}":
             raise DataIntegrityError(f"Final FASTA src identifier does not match sequence SHA-256: {token}")
         if state.conn.execute("SELECT 1 FROM sources WHERE sequence_sha256=? LIMIT 1", (digest,)).fetchone() is None:
             raise DataIntegrityError(f"Final FASTA sequence {digest} has no provenance.")
@@ -14856,7 +14851,7 @@ def calculate_assembly_coverage_metrics(
     """Calculate strain/isolate/source coverage from the final assembly state.
 
     Group identities always include species TaxID so identical strain/isolate
-    labels belonging to different fungal species are never merged.
+    labels belonging to different species are never merged.
 
     Strain and isolate labels use the same deterministic normalization as the
     biological selection engine.
@@ -15874,9 +15869,9 @@ def write_species_master(state: StateDB, work_root: Path, config: BuildConfig) -
             "Included_current_DB": bool_tsv(n_selected > 0),
             "Last_checked_NCBI": value_tsv(s["last_checked_ncbi"]), "DB_version": value_tsv(config.db_version),
         })
-    tsv = work_root / METADATA_DIR / "fungal_species_master.tsv"
+    tsv = work_root / METADATA_DIR / "species_master.tsv"
     write_tsv(tsv, fields, rows)
-    write_xlsx_from_tsv(tsv, work_root / METADATA_DIR / "fungal_species_master.xlsx")
+    write_xlsx_from_tsv(tsv, work_root / METADATA_DIR / "species_master.xlsx")
 
 
 def write_assemblies_master(state: StateDB, work_root: Path, config: BuildConfig) -> None:
@@ -15974,9 +15969,9 @@ def write_assemblies_master(state: StateDB, work_root: Path, config: BuildConfig
             "Final_reason": value_tsv(a["final_reason"]), "Update_change": value_tsv(final_update_change),
             "Update_reason": value_tsv(final_update_reason), "DB_version": value_tsv(config.db_version),
         })
-    tsv = work_root / METADATA_DIR / "fungal_assemblies_master.tsv"
+    tsv = work_root / METADATA_DIR / "assemblies_master.tsv"
     write_tsv(tsv, fields, rows)
-    write_xlsx_from_tsv(tsv, work_root / METADATA_DIR / "fungal_assemblies_master.xlsx")
+    write_xlsx_from_tsv(tsv, work_root / METADATA_DIR / "assemblies_master.xlsx")
 
 
 def write_build_summary(
@@ -16959,7 +16954,7 @@ def overwrite_staging_path(target: Path) -> Path:
     initial overwrite run and any later --resume must agree on exactly the same
     staging location.
     """
-    return target.parent / f".{target.name}.FungiFunk_refdb_update_staging"
+    return target.parent / f".{target.name}.TAURIDAsProt_update_staging"
 
 
 def finalize_manual_ncbi_recovery_staging(
@@ -17157,7 +17152,7 @@ def finalize_manual_ncbi_recovery_staging(
 
 def recovery_staging_path(target: Path) -> Path:
     """Return the isolated staging directory for manual NCBI recovery."""
-    return target.parent / f".{target.name}.FungiFunk_refdb_recovery_staging"
+    return target.parent / f".{target.name}.TAURIDAsProt_recovery_staging"
 
 
 def prepare_manual_recovery_output_snapshot(
@@ -17279,7 +17274,7 @@ def choose_work_and_source_roots(
         staging = recovery_staging_path(source)
 
         backup = source.parent / (
-            f".{source.name}.FungiFunk_refdb_previous_backup"
+            f".{source.name}.TAURIDAsProt_previous_backup"
         )
 
         # Never proceed while a previous replacement backup exists.
@@ -17349,22 +17344,22 @@ def choose_work_and_source_roots(
                         "a resumable persistent state:\n"
                         f"  {staging}\n\n"
                         "Continue that existing staging build instead with:\n"
-                        f"  FungiFunk_refdb.sh --resume --outdir {staging}"
+                        f"  TAURIDAsProt.sh --resume --outdir {staging}"
                     )
 
                 raise ConfigError(
-                    "A previous FungiFunk_refdb safe-update staging directory exists, "
+                    "A previous TAURIDAsProt safe-update staging directory exists, "
                     "but the previous run stopped before a resumable state was created:\n"
                     f"  {staging}\n\n"
                     "--resume cannot be used for that staging directory. Correct the "
                     "original problem, remove the incomplete staging directory "
                     "manually, and rerun --overwrite-with-updated-version.\n\n"
-                    "FungiFunk_refdb will not remove the incomplete staging directory "
+                    "TAURIDAsProt will not remove the incomplete staging directory "
                     "automatically."
                 )
 
             raise ConfigError(
-                "Refusing to use an existing non-FungiFunk staging path: "
+                "Refusing to use an existing non-TAURIDAsProt staging path: "
                 f"{staging}. Move/remove it manually first."
             )
 
@@ -17409,7 +17404,7 @@ def safe_replace_completed_directory(staging: Path, target: Path) -> None:
     """
     if staging.parent.resolve() != target.parent.resolve():
         raise DataIntegrityError("Safe overwrite staging and target must be sibling directories on the same filesystem.")
-    backup = target.parent / f".{target.name}.FungiFunk_refdb_previous_backup"
+    backup = target.parent / f".{target.name}.TAURIDAsProt_previous_backup"
     if backup.exists():
         raise DataIntegrityError(f"Safety backup path already exists and will not be overwritten: {backup}")
     fsync_dir(target.parent)
@@ -17508,7 +17503,7 @@ def record_manual_ncbi_recovery_wrapper_action(action: str) -> None:
             f"Invalid manual recovery wrapper action: {action!r}"
         )
 
-    log_path = os.environ.get("FUNGIFUNK_WRAPPER_RUN_INFO_LOG")
+    log_path = os.environ.get("TAURIDASPROT_WRAPPER_RUN_INFO_LOG")
 
     if not log_path:
         return
@@ -17722,13 +17717,13 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
 
         if not (resume_root / MARKER_REL).is_file():
             raise ConfigError(
-                "The --resume target is not recognized as a FungiFunk_refdb "
+                "The --resume target is not recognized as a TAURIDAsProt "
                 f"build: {resume_root}"
             )
 
         if not (resume_root / RESUME_READY_REL).is_file():
             raise ConfigError(
-                "The previous run stopped before a resumable FungiFunk_refdb "
+                "The previous run stopped before a resumable TAURIDAsProt "
                 "state was created."
             )
 
@@ -17861,7 +17856,7 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                         "ASSEMBLY_SEARCH_AND_SELECTION has already started "
                         "for this build.\n\n"
                         f"Current build state: {current_state}\n\n"
-                        "Biological configuration determines which fungal taxa "
+                        "Biological configuration determines which taxa "
                         "and genome assemblies can contribute proteins to the "
                         "reference database. See BIOLOGICAL CONFIGURATION "
                         "in --help for the complete option list.\n\n"
@@ -17961,7 +17956,7 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             if work_root.resolve() != expected_staging.resolve():
                 raise DataIntegrityError(
                     "Refusing to complete resumed overwrite because the current "
-                    "directory is not the expected FungiFunk_refdb staging path.\n"
+                    "directory is not the expected TAURIDAsProt staging path.\n"
                     f"Current staging: {work_root}\n"
                     f"Expected staging: {expected_staging}\n"
                     f"Original reference: {source_root}"
@@ -18196,7 +18191,7 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                 )
 
             info(
-                "Building the curated fungal species set using "
+                "Building the curated species set using "
                 f"{curation_input_text}."
             )
 
@@ -18277,11 +18272,11 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                 pause_for_curation_fix(state, work_root, conflict)
                 raise
             write_resolved_taxon_rules(
-                work_root / METADATA_DIR / "fungal_seed_taxa_resolved.tsv",
+                work_root / METADATA_DIR / "seed_taxa_resolved.tsv",
                 seed_rules, seed_counts, exclusion=False,
             )
             write_resolved_taxon_rules(
-                work_root / METADATA_DIR / "fungal_exclusion_taxa_resolved.tsv",
+                work_root / METADATA_DIR / "exclusion_taxa_resolved.tsv",
                 exclusion_rules, exclusion_counts, exclusion=True,
             )
             write_excluded_taxa_report(work_root, excluded_rows)
@@ -18405,8 +18400,8 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                 ).fetchone()[0]
             )
 
-            # Legacy interrupted builds have no per-species checkpoints.
-            # Rebuild their partial inventory once for safe migration.
+            # An inventory without per-species checkpoints cannot be resumed safely.
+            # Rebuild it once before continuing.
             legacy_inventory_cleared = (
                 assembly_count > 0 and completed_species_count == 0
             )
@@ -19087,17 +19082,17 @@ def main(
 
         info(
             f"  Species master: "
-            f"{final_root / METADATA_DIR / 'fungal_species_master.tsv'}"
+            f"{final_root / METADATA_DIR / 'species_master.tsv'}"
         )
 
         info(
             f"  Assembly master: "
-            f"{final_root / METADATA_DIR / 'fungal_assemblies_master.tsv'}"
+            f"{final_root / METADATA_DIR / 'assemblies_master.tsv'}"
         )
 
         info(
             f"  Protein metadata: "
-            f"{final_root / METADATA_DIR / 'fungal_protein_metadata.tsv'}"
+            f"{final_root / METADATA_DIR / 'protein_metadata.tsv'}"
         )
 
         info(
@@ -19112,16 +19107,16 @@ def main(
 
         info(
             f"  Protein provenance TSV: "
-            f"{final_root / METADATA_DIR / 'fungal_protein_sources.tsv'}"
+            f"{final_root / METADATA_DIR / 'protein_sources.tsv'}"
         )
 
         info(
             f"  Protein provenance YAML: "
-            f"{final_root / METADATA_DIR / 'fungal_protein_sources.yaml.gz'}"
+            f"{final_root / METADATA_DIR / 'protein_sources.yaml.gz'}"
         )
 
         # The shell wrapper finalizes the console log after Python exits.
-        console_log_name = os.environ.get("FUNGIFUNK_CONSOLE_LOG_NAME")
+        console_log_name = os.environ.get("TAURIDASPROT_CONSOLE_LOG_NAME")
 
         if console_log_name:
             console_log_path = final_root / LOGS_DIR / console_log_name
@@ -19130,7 +19125,7 @@ def main(
             # the original reference, which must remain untouched.
             if getattr(ns, "retry_ncbi_failures", False):
                 wrapper_log = os.environ.get(
-                    "FUNGIFUNK_WRAPPER_RUN_INFO_LOG"
+                    "TAURIDASPROT_WRAPPER_RUN_INFO_LOG"
                 )
 
                 if wrapper_log:
@@ -19149,7 +19144,7 @@ def main(
                         console_log_path = (
                             final_root.parent
                             / (
-                                f".{final_root.name}.FungiFunk_refdb_"
+                                f".{final_root.name}.TAURIDAsProt_"
                                 f"{console_log_name}"
                             )
                         )
@@ -19166,7 +19161,7 @@ def main(
 
         return exc.exit_code
 
-    except FungiFunkError as exc:
+    except TAURIDAsProtError as exc:
 
         error(
             str(exc)
