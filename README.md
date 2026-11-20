@@ -8,7 +8,7 @@ You choose which organisms and assemblies to include. TAURIDAsProt retrieves the
 
 It can also resume interrupted runs, update existing references while reusing previous work, and retry failed NCBI downloads without repeating the full assembly search.
 
-**Current version:** v0.6.0
+**Current version:** v0.6.1\
 **Status:** Active development
 
 ## Key features

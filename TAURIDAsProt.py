@@ -46,7 +46,7 @@ except ImportError:
 ########################################################################################################
 
 TOOL_NAME = "TAURIDAsProt"
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 FINAL_FASTA_NAME = "TAURIDAsProt_protein_refdb.faa"
 
 ESTIMATED_RAM_GIB_PER_WORKER = 1.0
@@ -1283,6 +1283,7 @@ class BuildConfig:
     include_explicit_targets: str | None = None
     exclude_explicit_targets: str | None = None
     tmpdir: str | None = None
+    include_grouped_yaml: bool = False
     db_version: str | None = None
     workers: str | int = "auto"
     force: bool = False
@@ -1629,6 +1630,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--tmpdir")
+
+    grouped_yaml = p.add_mutually_exclusive_group()
+
+    grouped_yaml.add_argument(
+        "--include-grouped-yaml",
+        action="store_true",
+        default=False,
+        help=(
+            "Generate metadata/protein_sources.yaml.gz. "
+            "Disabled by default. WARNING: large references may require "
+            "substantial temporary disk space for SQLite sorting. "
+            "Using --tmpdir on storage with sufficient free space "
+            "is strongly recommended."
+        ),
+    )
+
+    grouped_yaml.add_argument(
+        "--skip-grouped-yaml",
+        action="store_true",
+        default=False,
+        help=(
+            "With --resume, skip grouped YAML generation even if "
+            "the original build requested it. "
+        ),
+    )
+
     p.add_argument("--db-version")
     p.add_argument(
         "--reset-biological-config",
@@ -1997,6 +2024,11 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
 
     run_mode = detect_run_mode(ns)
 
+    if ns.skip_grouped_yaml and run_mode != "resume":
+        raise ConfigError(
+            "--skip-grouped-yaml is valid only with --resume."
+        )
+
     source = (
         str(Path(ns.source_refdb).expanduser().resolve())
         if ns.source_refdb
@@ -2217,6 +2249,7 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
         "workers",
         "force",
         "tmpdir",
+        "include_grouped_yaml",
         "verbose",
         "timestamps",
         "build_started",
@@ -2269,6 +2302,30 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
             if run_mode == "resume"
             else None
         )
+    )
+
+    # Grouped YAML is an optional output.
+    #
+    # New CREATE/UPDATE runs omit it unless explicitly requested.
+    # RESUME preserves the original choice.
+    #
+    # Legacy builds did not store this field and always generated
+    # the YAML, so a missing field means True only during RESUME.
+    if run_mode == "resume":
+        include_grouped_yaml = base.get(
+            "include_grouped_yaml",
+            True,
+        )
+    else:
+        include_grouped_yaml = False
+
+    if ns.include_grouped_yaml:
+        include_grouped_yaml = True
+    elif ns.skip_grouped_yaml:
+        include_grouped_yaml = False
+
+    resolved["include_grouped_yaml"] = bool(
+        include_grouped_yaml
     )
 
     # Explicit biological options override inherited values.
@@ -2586,6 +2643,57 @@ CREATE TABLE IF NOT EXISTS update_changes (
     reason TEXT NOT NULL
 );
 """
+
+
+def configure_sqlite_temporary_storage(
+    config: BuildConfig,
+    work_root: Path,
+    *,
+    tmpdir_requested: bool,
+) -> None:
+    """Choose and verify SQLite scratch storage before opening build state."""
+    import tempfile
+
+    # An explicit --tmpdir takes priority.
+    if tmpdir_requested and config.tmpdir:
+        directory = Path(config.tmpdir) / "sqlite"
+
+    # Otherwise respect an explicitly configured SQLite environment.
+    elif os.environ.get("SQLITE_TMPDIR"):
+        directory = Path(os.environ["SQLITE_TMPDIR"])
+
+    # An inherited --tmpdir may also be reused during RESUME.
+    elif config.tmpdir:
+        directory = Path(config.tmpdir) / "sqlite"
+
+    # Default: keep scratch storage in the build's working area.
+    else:
+        directory = work_root / TMP_DIR / "sqlite"
+
+    try:
+        directory = directory.expanduser().resolve()
+        directory.mkdir(
+            parents=True,
+            exist_ok=True,
+            mode=0o700,
+        )
+
+        # Verify that temporary files can actually be created.
+        with tempfile.TemporaryFile(dir=directory) as probe:
+            probe.write(b"SQLite temporary storage test")
+            probe.flush()
+
+    except OSError as exc:
+        raise ResourceSafetyError(
+            f"SQLite temporary directory is not writable: "
+            f"{directory}. Details: {exc}. "
+            "Use --tmpdir with a writable directory "
+            "on storage with sufficient free space."
+        ) from exc
+
+    os.environ["SQLITE_TMPDIR"] = str(directory)
+
+    info(f"SQLite temporary storage: {directory}")
 
 
 class StateDB:
@@ -14438,9 +14546,6 @@ def write_protein_sources(
         f"{total_sources:,} source records."
     )
 
-    # Export the same final provenance in grouped, compressed form.
-    write_grouped_protein_sources(state, work_root)
-
 
 def write_grouped_protein_sources(
     state: StateDB,
@@ -14580,6 +14685,78 @@ def write_grouped_protein_sources(
         f"Grouped protein provenance YAML complete: "
         f"{written:,} source records."
     )
+
+
+def write_optional_grouped_protein_sources(
+    state: StateDB,
+    work_root: Path,
+    config: BuildConfig,
+) -> None:
+    """Handle optional grouped provenance without affecting mandatory outputs."""
+    import errno
+
+    path = work_root / METADATA_DIR / "protein_sources.yaml.gz"
+    part = path.with_name(path.name + ".part")
+
+    if not config.include_grouped_yaml:
+        # Remove only optional artifacts left by an interrupted export.
+        part.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+
+        state.set_meta("grouped_yaml_export", "SKIPPED")
+        info("Optional grouped protein provenance YAML skipped.")
+        return
+
+    try:
+        write_grouped_protein_sources(state, work_root)
+
+    except sqlite3.OperationalError as exc:
+        error_code = getattr(exc, "sqlite_errorcode", None)
+        disk_full = (
+            (
+                error_code is not None
+                and (error_code & 0xFF) == sqlite3.SQLITE_FULL
+            )
+            or "database or disk is full" in str(exc).lower()
+        )
+
+        if not disk_full:
+            raise
+
+        raise ResourceSafetyError(
+            "Grouped YAML export failed: SQLite reported that "
+            "the database or disk is full.\n\n"
+            "This build remains resumable. Choose one option:\n"
+            "  1. Retry with more temporary disk space:\n"
+            f"     TAURIDAsProt.sh --resume --outdir {work_root} "
+            "--tmpdir /path/to/large/scratch\n"
+            "  2. Skip the optional grouped YAML:\n"
+            f"     TAURIDAsProt.sh --resume --outdir {work_root} "
+            "--skip-grouped-yaml\n\n"
+            "Previously committed biological work is preserved. "
+            "Mandatory reference validation will still be required."
+        ) from exc
+
+    except OSError as exc:
+        if exc.errno not in {
+            errno.ENOSPC,
+            getattr(errno, "EDQUOT", -1),
+        }:
+            raise
+
+        raise ResourceSafetyError(
+            "Grouped YAML export failed because disk space "
+            "or storage quota was exhausted.\n\n"
+            "Retry with more space:\n"
+            f"  TAURIDAsProt.sh --resume --outdir {work_root} "
+            "--tmpdir /path/to/large/scratch\n"
+            "Or skip the optional output:\n"
+            f"  TAURIDAsProt.sh --resume --outdir {work_root} "
+            "--skip-grouped-yaml\n\n"
+            "Mandatory reference validation will still be required."
+        ) from exc
+
+    state.set_meta("grouped_yaml_export", "GENERATED")
 
 
 def validate_final_reference(state: StateDB, work_root: Path) -> None:
@@ -17037,6 +17214,12 @@ def finalize_manual_ncbi_recovery_staging(
             work_root,
         )
 
+        write_optional_grouped_protein_sources(
+            state,
+            work_root,
+            config,
+        )
+
         state.set_global_state(
             "FINAL_OUTPUT_WRITING_COMPLETE"
         )
@@ -17575,6 +17758,8 @@ def report_manual_ncbi_recovery_remaining_failures(
 
 def orchestrate_manual_ncbi_recovery(
     config: BuildConfig,
+    *,
+    tmpdir_requested: bool,
 ) -> tuple[Path, Path | None]:
     """Recover NCBI failures without changing the original until promotion."""
     work_root, source_root, destructive_target = (
@@ -17591,6 +17776,12 @@ def orchestrate_manual_ncbi_recovery(
             "Manual NCBI recovery requires an isolated sibling staging "
             "directory and the original completed reference as its target."
         )
+
+    configure_sqlite_temporary_storage(
+        config,
+        work_root,
+        tmpdir_requested=tmpdir_requested,
+    )
 
     info(
         "Manual NCBI recovery: working in isolated staging "
@@ -17740,7 +17931,10 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
             config.db_version
         )
 
-        return orchestrate_manual_ncbi_recovery(config)
+        return orchestrate_manual_ncbi_recovery(
+            config,
+            tmpdir_requested=bool(ns.tmpdir),
+        )
 
     if config.run_mode != "resume" and not config.db_version:
         config.db_version = default_db_version()
@@ -17751,6 +17945,12 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
 
     work_root, source_root, destructive_target = choose_work_and_source_roots(config)
     initialize_output_layout(work_root)
+
+    configure_sqlite_temporary_storage(
+        config,
+        work_root,
+        tmpdir_requested=bool(ns.tmpdir),
+    )
 
     info(
         f"Run configuration resolved: mode={config.run_mode}; "
@@ -18890,6 +19090,12 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                 work_root,
             )
 
+            write_optional_grouped_protein_sources(
+                state,
+                work_root,
+                config,
+            )
+
             state.set_global_state(
                 "FINAL_OUTPUT_WRITING_COMPLETE"
             )
@@ -19110,10 +19316,18 @@ def main(
             f"{final_root / METADATA_DIR / 'protein_sources.tsv'}"
         )
 
-        info(
-            f"  Protein provenance YAML: "
-            f"{final_root / METADATA_DIR / 'protein_sources.yaml.gz'}"
+        grouped_yaml_path = (
+            final_root / METADATA_DIR / "protein_sources.yaml.gz"
         )
+
+        if grouped_yaml_path.is_file():
+            info(
+                f"  Protein provenance YAML: {grouped_yaml_path}"
+            )
+        else:
+            info(
+                "  Protein provenance YAML: not generated (optional)"
+            )
 
         # The shell wrapper finalizes the console log after Python exits.
         console_log_name = os.environ.get("TAURIDASPROT_CONSOLE_LOG_NAME")

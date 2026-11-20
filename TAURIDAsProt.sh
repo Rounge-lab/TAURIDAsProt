@@ -13,7 +13,7 @@ TEMPLATE_DIR="${script_dir}/TAURIDAsProt_templates"
 
 # Define the name, version and final output file of the tool
 TOOL_NAME="TAURIDAsProt"
-VERSION="0.6.0"
+VERSION="0.6.1"
 FINAL_FASTA_NAME="TAURIDAsProt_protein_refdb.faa"
 
 # Internal paths used by TAURIDAsProt
@@ -164,6 +164,8 @@ Help() {
     echo "        --workers"
     echo "        --force"
     echo "        --tmpdir"
+    echo "        --include-grouped-yaml"
+    echo "        --skip-grouped-yaml"
     echo "        --verbose"
     echo "        --timestamps"
     echo ""
@@ -307,6 +309,8 @@ Help() {
     echo "  --workers"
     echo "  --force"
     echo "  --tmpdir"
+    echo "  --include-grouped-yaml"
+    echo "  --skip-grouped-yaml"
     echo "  --verbose"
     echo "  --db-version"
     echo "  --timestamps"
@@ -476,7 +480,23 @@ Help() {
     echo ""
     echo "  --tmpdir <dir>"
     echo "      Optional alternative temporary workspace."
-    echo "      This is a computational setting and may be changed during --resume."
+    echo "      May be changed during --resume."
+    echo ""
+    echo "  --include-grouped-yaml"
+    echo "      Generate metadata/protein_sources.yaml.gz."
+    echo "      Optional and DISABLED by default."
+    echo ""
+    echo "      WARNING: This export may require substantial temporary disk"
+    echo "      space. SQLite sorts protein provenance records, and large"
+    echo "      references may require many gigabytes of free space."
+    echo ""
+    echo "      Using --tmpdir on storage with sufficient free space"
+    echo "      is strongly recommended when requesting this output."
+    echo ""
+    echo "  --skip-grouped-yaml"
+    echo "      Available only with --resume."
+    echo "      Skip the grouped YAML export, even if the original build"
+    echo "      requested it."
     echo ""
     echo "  --db-version <string>"
     echo "      Optional human-readable database-version identity/provenance label."
@@ -1223,6 +1243,8 @@ METADATA_FILTERS=""
 INCLUDE_EXPLICIT_TARGETS=""
 EXCLUDE_EXPLICIT_TARGETS=""
 TMPDIR_ARG=""
+INCLUDE_GROUPED_YAML=false
+SKIP_GROUPED_YAML=false
 DB_VERSION_LABEL=""
 
 RESET_BIOLOGICAL_CONFIG=false
@@ -1634,6 +1656,14 @@ while [[ "$#" -gt 0 ]]; do
             TMPDIR_ARG="$2"
             shift 2
             ;;
+        --include-grouped-yaml)
+            INCLUDE_GROUPED_YAML=true
+            shift
+            ;;
+        --skip-grouped-yaml)
+            SKIP_GROUPED_YAML=true
+            shift
+            ;;
         --db-version)
             require_value "$1" "$#"
             DB_VERSION_LABEL="$2"
@@ -1707,6 +1737,20 @@ done
 if [[ "$RUN_MODE_COUNT" -eq 0 ]]; then
     log_msg "[ERROR] No run mode was specified. Choose exactly one of --create, --resume, --create-new-updated-version, --overwrite-with-updated-version, or --retry-ncbi-failures."
     Help
+    exit 2
+fi
+
+# Grouped YAML controls are export options, not biological settings.
+# Validate them independently of the selected run mode.
+if [[ "$INCLUDE_GROUPED_YAML" == true &&
+      "$SKIP_GROUPED_YAML" == true ]]; then
+    log_msg "[ERROR] --include-grouped-yaml and --skip-grouped-yaml cannot be used together." >&2
+    exit 2
+fi
+
+if [[ "$SKIP_GROUPED_YAML" == true &&
+      "$RUN_MODE" != "resume" ]]; then
+    log_msg "[ERROR] --skip-grouped-yaml is valid only with --resume." >&2
     exit 2
 fi
 
