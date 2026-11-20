@@ -13,7 +13,7 @@ TEMPLATE_DIR="${script_dir}/TAURIDAsProt_templates"
 
 # Define the name, version and final output file of the tool
 TOOL_NAME="TAURIDAsProt"
-VERSION="0.6.1"
+VERSION="0.6.2"
 FINAL_FASTA_NAME="TAURIDAsProt_protein_refdb.faa"
 
 # Internal paths used by TAURIDAsProt
@@ -164,6 +164,8 @@ Help() {
     echo "        --workers"
     echo "        --force"
     echo "        --tmpdir"
+    echo "        --include-provenance-tsv"
+    echo "        --skip-provenance-tsv"
     echo "        --include-grouped-yaml"
     echo "        --skip-grouped-yaml"
     echo "        --verbose"
@@ -309,6 +311,8 @@ Help() {
     echo "  --workers"
     echo "  --force"
     echo "  --tmpdir"
+    echo "  --include-provenance-tsv"
+    echo "  --skip-provenance-tsv"
     echo "  --include-grouped-yaml"
     echo "  --skip-grouped-yaml"
     echo "  --verbose"
@@ -482,6 +486,27 @@ Help() {
     echo "      Optional alternative temporary workspace."
     echo "      May be changed during --resume."
     echo ""
+    echo "  --include-provenance-tsv"
+    echo "      Export protein provenance to metadata/protein_sources.tsv."
+    echo "      Optional and DISABLED by default."
+    echo ""
+    echo "      All original protein source records remain permanently stored"
+    echo "      in state/build_state.sqlite, even when this TSV is omitted."
+    echo ""
+    echo "      WARNING: Large references may require many hours to export"
+    echo "      millions of provenance records, as well as substantial disk"
+    echo "      space for the TSV and SQLite temporary sorting files."
+    echo ""
+    echo "      Using --tmpdir on storage with sufficient free space"
+    echo "      is strongly recommended when requesting this output."
+    echo "      The reference output directory must also have enough space"
+    echo "      for the TSV file itself."
+    echo ""
+    echo "  --skip-provenance-tsv"
+    echo "      Available only with --resume."
+    echo "      Skip TSV export, even if the interrupted build originally"
+    echo "      requested it."
+    echo ""
     echo "  --include-grouped-yaml"
     echo "      Generate metadata/protein_sources.yaml.gz."
     echo "      Optional and DISABLED by default."
@@ -492,6 +517,8 @@ Help() {
     echo ""
     echo "      Using --tmpdir on storage with sufficient free space"
     echo "      is strongly recommended when requesting this output."
+    echo "      The reference output directory must also have enough space"
+    echo "      for the YAML file itself."
     echo ""
     echo "  --skip-grouped-yaml"
     echo "      Available only with --resume."
@@ -923,7 +950,8 @@ Help() {
     echo "      assemblies_master.tsv"
     echo "      assemblies_master.xlsx           [if openpyxl is available]"
     echo "      protein_metadata.tsv"
-    echo "      protein_sources.tsv"
+    echo "      protein_sources.tsv              [optional: --include-provenance-tsv]"
+    echo "      protein_sources.yaml.gz          [optional: --include-grouped-yaml]"
     echo ""
     echo "Reports:"
     echo ""
@@ -949,6 +977,7 @@ Help() {
     echo ""
     echo "      build_state.sqlite"
     echo "          Transactional build state and committed checkpoints."
+    echo "          Also stores the original protein provenance records"
     echo ""
     echo "      build_manifest.tsv"
     echo "          Final cryptographic inventory of completed reference contents."
@@ -1243,6 +1272,8 @@ METADATA_FILTERS=""
 INCLUDE_EXPLICIT_TARGETS=""
 EXCLUDE_EXPLICIT_TARGETS=""
 TMPDIR_ARG=""
+INCLUDE_PROVENANCE_TSV=false
+SKIP_PROVENANCE_TSV=false
 INCLUDE_GROUPED_YAML=false
 SKIP_GROUPED_YAML=false
 DB_VERSION_LABEL=""
@@ -1656,6 +1687,14 @@ while [[ "$#" -gt 0 ]]; do
             TMPDIR_ARG="$2"
             shift 2
             ;;
+        --include-provenance-tsv)
+            INCLUDE_PROVENANCE_TSV=true
+            shift
+            ;;
+        --skip-provenance-tsv)
+            SKIP_PROVENANCE_TSV=true
+            shift
+            ;;
         --include-grouped-yaml)
             INCLUDE_GROUPED_YAML=true
             shift
@@ -1740,8 +1779,20 @@ if [[ "$RUN_MODE_COUNT" -eq 0 ]]; then
     exit 2
 fi
 
-# Grouped YAML controls are export options, not biological settings.
+# Provenance export controls are not biological settings.
 # Validate them independently of the selected run mode.
+if [[ "$INCLUDE_PROVENANCE_TSV" == true &&
+      "$SKIP_PROVENANCE_TSV" == true ]]; then
+    log_msg "[ERROR] --include-provenance-tsv and --skip-provenance-tsv cannot be used together." >&2
+    exit 2
+fi
+
+if [[ "$SKIP_PROVENANCE_TSV" == true &&
+      "$RUN_MODE" != "resume" ]]; then
+    log_msg "[ERROR] --skip-provenance-tsv is valid only with --resume." >&2
+    exit 2
+fi
+
 if [[ "$INCLUDE_GROUPED_YAML" == true &&
       "$SKIP_GROUPED_YAML" == true ]]; then
     log_msg "[ERROR] --include-grouped-yaml and --skip-grouped-yaml cannot be used together." >&2

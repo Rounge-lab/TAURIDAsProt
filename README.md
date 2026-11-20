@@ -8,7 +8,7 @@ You choose which organisms and assemblies to include. TAURIDAsProt retrieves the
 
 It can also resume interrupted runs, update existing references while reusing previous work, and retry failed NCBI downloads without repeating the full assembly search.
 
-**Current version:** v0.6.1\
+**Current version:** v0.6.2\
 **Status:** Active development
 
 ## Key features
@@ -16,6 +16,8 @@ It can also resume interrupted runs, update existing references while reusing pr
 - **Create protein reference databases** from user-selected taxa and genome assemblies.
 - **Customise assembly selection** using taxonomic information, assembly quality, strain representation, and other available metadata.
 - **Remove duplicate proteins** while preserving information about all their original biological sources.
+- **Keep complete protein provenance records** in a SQLite database.
+- **Optionally export protein provenance** as a TSV file or a compressed YAML file.
 - **Resume interrupted runs** using saved progress.
 - **Update existing references** while reusing previously processed data when possible.
 - **Safely replace existing databases** only after the updated reference has been validated.
@@ -174,6 +176,27 @@ These options can still be corrected when resuming a run, provided assembly sear
 
 Other settings, such as the number of workers (`--workers`) or the temporary directory (`--tmpdir`), can still be adjusted during resume when applicable.
 
+Protein provenance exports can also be enabled or skipped during resume:
+
+- `--include-provenance-tsv`: Generate the protein provenance TSV.
+- `--skip-provenance-tsv`: Skip the protein provenance TSV.
+- `--include-grouped-yaml`: Generate the grouped protein provenance YAML.
+- `--skip-grouped-yaml`: Skip the grouped protein provenance YAML.
+
+The two `--skip` options are only available with `--resume`. They can be particularly useful when an interrupted run would otherwise need to generate a large provenance file.
+
+For example, to resume a build without generating either provenance export:
+
+```bash
+bash TAURIDAsProt.sh \
+    --resume \
+    --outdir reference_db \
+    --skip-provenance-tsv \
+    --skip-grouped-yaml
+```
+
+By default, resume preserves the export settings of the original run unless you explicitly change it during resume.
+
 For the complete list of biological configuration options, see the `BIOLOGICAL CONFIGURATION` section in `--help`.
 
 ### 3. Create a new updated version
@@ -190,6 +213,8 @@ bash TAURIDAsProt.sh \
 This mode creates the updated database in a separate directory.
 
 By default, the biological selection settings are inherited from the original reference. These settings can be modified using the corresponding options.
+
+Protein provenance exports are not inherited when creating an updated reference. The TSV and grouped YAML are disabled by default, even if they were included in the original reference. You can request either export using `--include-provenance-tsv` or `--include-grouped-yaml`.
 
 ### 4. Safely overwrite an existing reference
 
@@ -313,16 +338,41 @@ metadata/
     species_master.tsv
     assemblies_master.tsv
     protein_metadata.tsv
-    protein_sources.tsv
-    protein_sources.yaml.gz
+    protein_sources.tsv          [optional]
+    protein_sources.yaml.gz      [optional]
     reproduction_targets.tsv
 ```
 
-These tables make it possible to identify the original sources of the proteins included in the reference.
+TAURIDAsProt always saves the original protein provenance records in `state/build_state.sqlite`.
 
-`protein_sources.tsv` lists the original protein records contributing to the reference, including multiple sources for identical sequences.
+Two optional files are available for users who want to work with protein provenance outside the SQLite database:
 
-`protein_sources.yaml.gz` provides grouped provenance information in a compressed format.
+- `protein_sources.tsv` lists the original protein records contributing to the reference, including multiple sources for identical sequences.
+- `protein_sources.yaml.gz` provides grouped protein provenance information in a compressed format.
+
+**Both files are disabled by default when creating or updating a reference.**
+
+You can request them using:
+
+- `--include-provenance-tsv`: Generate `metadata/protein_sources.tsv`.
+- `--include-grouped-yaml`: Generate `metadata/protein_sources.yaml.gz`.
+
+These options are independent. You can generate either file, both files, or neither.
+
+For example, to create a reference with both provenance exports:
+
+```bash
+bash TAURIDAsProt.sh \
+    --create \
+    --seed-taxa seed_taxa.tsv \
+    --outdir reference_db \
+    --include-provenance-tsv \
+    --include-grouped-yaml
+```
+
+If you only need one of these files, simply use its corresponding option.
+
+For large references, generating provenance exports can take considerable time and require additional disk space. Using `--tmpdir` with sufficient free space is recommended when requesting these files. The reference output directory must also have enough space for the exported files themselves.
 
 `reproduction_targets.tsv` contains the exact versioned genome assembly accessions selected for the completed reference.
 
@@ -357,7 +407,13 @@ Additional reports describe excluded taxa, filtering decisions, and changes intr
 
 The `state/` directory stores the information required to track progress, resume interrupted runs, and verify completed references.
 
-These files are managed automatically by TAURIDAsProt.
+One of its main files is `state/build_state.sqlite`.
+
+This SQLite database also stores the complete protein provenance information. It contains the original sources of the proteins included in the reference, even when the optional TSV and YAML files are not generated.
+
+Protein provenance can be explored using any SQLite-compatible tool. The original source records are stored in the `sources` table.
+
+These files are managed automatically by TAURIDAsProt. The SQLite database is part of the completed reference and should be kept together with the other output files.
 
 ### Logs
 
@@ -381,7 +437,7 @@ This reduces unnecessary duplication while preserving the biological information
 
 **Importantly, identical protein sequences are combined without losing their original sources.**
 
-The accompanying metadata records all contributing protein sources, allowing users to trace reference proteins back to their original assemblies and organisms.
+TAURIDAsProt always records all contributing protein sources in its SQLite database, allowing users to trace reference proteins back to their original assemblies and organisms.
 
 Before comparing proteins, TAURIDAsProt removes FASTA formatting whitespace, converts letters to uppercase, and ignores a final translation-stop marker (`*`) when determining sequence identity. The original stop marker is still recorded in the provenance information.
 
@@ -392,6 +448,10 @@ Only proteins whose complete processed sequences are identical are combined. Sim
 TAURIDAsProt can automatically choose the number of workers based on the available CPUs, memory, and disk space.
 
 You can also choose the number of workers yourself using `--workers`. The `--force` option allows an explicitly requested worker count to exceed the program's recommendation, but it does not disable disk-space protection, integrity checks, or NCBI request limits.
+
+Protein provenance is always stored in SQLite. Exporting it to TSV or grouped YAML is optional and can require substantial processing time and disk space for large references.
+
+When requesting either export, using `--tmpdir` with sufficient free space is recommended for temporary SQLite operations. The final exported files are written to the reference output directory, which must also have enough available space.
 
 When updating an existing reference, TAURIDAsProt uses a separate working directory so that the original database remains available until the new version is ready and validated.
 

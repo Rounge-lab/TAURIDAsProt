@@ -46,7 +46,7 @@ except ImportError:
 ########################################################################################################
 
 TOOL_NAME = "TAURIDAsProt"
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 FINAL_FASTA_NAME = "TAURIDAsProt_protein_refdb.faa"
 
 ESTIMATED_RAM_GIB_PER_WORKER = 1.0
@@ -1283,6 +1283,7 @@ class BuildConfig:
     include_explicit_targets: str | None = None
     exclude_explicit_targets: str | None = None
     tmpdir: str | None = None
+    include_provenance_tsv: bool = False
     include_grouped_yaml: bool = False
     db_version: str | None = None
     workers: str | int = "auto"
@@ -1630,6 +1631,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--tmpdir")
+
+    provenance_tsv = p.add_mutually_exclusive_group()
+
+    provenance_tsv.add_argument(
+        "--include-provenance-tsv",
+        action="store_true",
+        default=False,
+        help=(
+            "Export all original protein source records to "
+            "metadata/protein_sources.tsv. Disabled by default. "
+            "The underlying provenance remains available in SQLite. "
+            "Large references may require substantial export time "
+            "and temporary disk space."
+        ),
+    )
+
+    provenance_tsv.add_argument(
+        "--skip-provenance-tsv",
+        action="store_true",
+        default=False,
+        help=(
+            "With --resume, omit the optional protein provenance TSV "
+            "even if the interrupted build originally requested it. "
+            "Does not remove provenance records from SQLite or bypass "
+            "final reference validation."
+        ),
+    )
 
     grouped_yaml = p.add_mutually_exclusive_group()
 
@@ -2024,6 +2052,11 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
 
     run_mode = detect_run_mode(ns)
 
+    if ns.skip_provenance_tsv and run_mode != "resume":
+        raise ConfigError(
+            "--skip-provenance-tsv is valid only with --resume."
+        )
+
     if ns.skip_grouped_yaml and run_mode != "resume":
         raise ConfigError(
             "--skip-grouped-yaml is valid only with --resume."
@@ -2249,6 +2282,7 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
         "workers",
         "force",
         "tmpdir",
+        "include_provenance_tsv",
         "include_grouped_yaml",
         "verbose",
         "timestamps",
@@ -2326,6 +2360,29 @@ def resolve_config(ns: argparse.Namespace) -> BuildConfig:
 
     resolved["include_grouped_yaml"] = bool(
         include_grouped_yaml
+    )
+
+    # Protein provenance is stored permanently in the SQLite sources table.
+    #
+    # New CREATE/UPDATE builds omit the TSV by default.
+    # RESUME preserves the original build's export choice.
+    #
+    # Legacy builds did not store this field and always generated the TSV.
+    if run_mode in {"resume", "retry-ncbi-failures"}:
+        include_provenance_tsv = base.get(
+            "include_provenance_tsv",
+            True,
+        )
+    else:
+        include_provenance_tsv = False
+
+    if ns.include_provenance_tsv:
+        include_provenance_tsv = True
+    elif ns.skip_provenance_tsv:
+        include_provenance_tsv = False
+
+    resolved["include_provenance_tsv"] = bool(
+        include_provenance_tsv
     )
 
     # Explicit biological options override inherited values.
@@ -14547,6 +14604,87 @@ def write_protein_sources(
     )
 
 
+def write_optional_protein_sources(
+    state: StateDB,
+    work_root: Path,
+    config: BuildConfig,
+) -> None:
+    """Manage optional TSV export while preserving SQLite provenance."""
+    import errno
+
+    path = work_root / METADATA_DIR / "protein_sources.tsv"
+    part = path.with_name(path.name + ".part")
+
+    if not config.include_provenance_tsv:
+        # Remove only export files from the current working reference.
+        # The source records remain in SQLite.
+        part.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+
+        state.set_meta("provenance_tsv_export", "SKIPPED")
+        info(
+            "Optional protein provenance TSV skipped. "
+            "Source records remain available in the protein provenance SQLite."
+        )
+        return
+
+    try:
+        write_protein_sources(state, work_root)
+
+    except (sqlite3.OperationalError, OSError) as exc:
+        sqlite_code = getattr(exc, "sqlite_errorcode", None)
+
+        sqlite_full = (
+            isinstance(exc, sqlite3.OperationalError)
+            and (
+                (
+                    sqlite_code is not None
+                    and (sqlite_code & 0xFF) == sqlite3.SQLITE_FULL
+                )
+                or "database or disk is full" in str(exc).lower()
+            )
+        )
+
+        storage_full = (
+            isinstance(exc, OSError)
+            and exc.errno in {
+                errno.ENOSPC,
+                getattr(errno, "EDQUOT", -1),
+            }
+        )
+
+        if not (sqlite_full or storage_full):
+            raise
+
+        if config.run_mode == "retry-ncbi-failures":
+            guidance = (
+                "This failure occurred during manual NCBI recovery. "
+                "Inspect the isolated recovery staging before retrying. "
+                "The original completed reference has not been "
+                "replaced by this failed export."
+            )
+        else:
+            guidance = (
+                "The interrupted build can be resumed.\n"
+                "To omit this optional export, use:\n"
+                "  --resume --skip-provenance-tsv\n\n"
+                "To retry the TSV export, ensure sufficient free space "
+                "and storage quota both in the reference output directory "
+                "(for the TSV file) and in SQLite temporary storage "
+                "(configurable with --tmpdir DIR).\n"
+                "Resume using the original build's --outdir."
+            )
+
+        raise ResourceSafetyError(
+            "Protein provenance TSV export failed because SQLite "
+            "or the filesystem reported insufficient storage.\n\n"
+            + guidance
+            + "\n\nThe original source records remain in SQLite."
+        ) from exc
+
+    state.set_meta("provenance_tsv_export", "GENERATED")
+
+
 def write_grouped_protein_sources(
     state: StateDB,
     work_root: Path,
@@ -14704,8 +14842,39 @@ def write_optional_grouped_protein_sources(
         path.unlink(missing_ok=True)
 
         state.set_meta("grouped_yaml_export", "SKIPPED")
-        info("Optional grouped protein provenance YAML skipped.")
+        info("Optional grouped protein provenance YAML skipped. "
+        "Source records remain available in the protein provenance SQLite.")
         return
+
+    # Prepare recovery instructions before attempting the export.
+    if config.run_mode == "retry-ncbi-failures":
+        recovery_guidance = (
+            "This failure occurred during manual NCBI recovery.\n"
+            "The original completed reference remains unchanged.\n\n"
+            "Recovery instructions:\n"
+            "  1. Ensure sufficient free space and storage quota in "
+            "both the reference output directory and SQLite "
+            "temporary storage.\n"
+            "  2. Retry manual recovery using "
+            "--retry-ncbi-failures --source-refdb ORIGINAL_REFERENCE, "
+            "optionally specifying --tmpdir /path/to/large/scratch.\n\n"
+            "Do not use --resume on the recovery staging directory."
+        )
+    else:
+        recovery_guidance = (
+            "This build remains resumable. Choose one option:\n\n"
+            "  1. Retry the grouped YAML export with sufficient "
+            "temporary disk space:\n"
+            f"     TAURIDAsProt.sh --resume --outdir {work_root} "
+            "--tmpdir /path/to/large/scratch\n\n"
+            "  2. Skip the optional grouped YAML:\n"
+            f"     TAURIDAsProt.sh --resume --outdir {work_root} "
+            "--skip-grouped-yaml\n\n"
+            "IMPORTANT: The reference output directory must also "
+            "have sufficient free space and storage quota for "
+            "the YAML file itself.\n\n"
+            "Previously committed biological work is preserved."
+        )
 
     try:
         write_grouped_protein_sources(state, work_root)
@@ -14726,15 +14895,8 @@ def write_optional_grouped_protein_sources(
         raise ResourceSafetyError(
             "Grouped YAML export failed: SQLite reported that "
             "the database or disk is full.\n\n"
-            "This build remains resumable. Choose one option:\n"
-            "  1. Retry with more temporary disk space:\n"
-            f"     TAURIDAsProt.sh --resume --outdir {work_root} "
-            "--tmpdir /path/to/large/scratch\n"
-            "  2. Skip the optional grouped YAML:\n"
-            f"     TAURIDAsProt.sh --resume --outdir {work_root} "
-            "--skip-grouped-yaml\n\n"
-            "Previously committed biological work is preserved. "
-            "Mandatory reference validation will still be required."
+            + recovery_guidance
+            + "\n\nMandatory reference validation remains required."
         ) from exc
 
     except OSError as exc:
@@ -14747,13 +14909,8 @@ def write_optional_grouped_protein_sources(
         raise ResourceSafetyError(
             "Grouped YAML export failed because disk space "
             "or storage quota was exhausted.\n\n"
-            "Retry with more space:\n"
-            f"  TAURIDAsProt.sh --resume --outdir {work_root} "
-            "--tmpdir /path/to/large/scratch\n"
-            "Or skip the optional output:\n"
-            f"  TAURIDAsProt.sh --resume --outdir {work_root} "
-            "--skip-grouped-yaml\n\n"
-            "Mandatory reference validation will still be required."
+            + recovery_guidance
+            + "\n\nMandatory reference validation remains required."
         ) from exc
 
     state.set_meta("grouped_yaml_export", "GENERATED")
@@ -17209,9 +17366,10 @@ def finalize_manual_ncbi_recovery_staging(
             work_root,
         )
 
-        write_protein_sources(
+        write_optional_protein_sources(
             state,
             work_root,
+            config,
         )
 
         write_optional_grouped_protein_sources(
@@ -19085,9 +19243,10 @@ def orchestrate(ns: argparse.Namespace) -> tuple[Path, Path | None]:
                 work_root,
             )
 
-            write_protein_sources(
+            write_optional_protein_sources(
                 state,
                 work_root,
+                config,
             )
 
             write_optional_grouped_protein_sources(
@@ -19311,10 +19470,18 @@ def main(
             f"{final_root / REPORTS_DIR / 'build_summary.tsv'}"
         )
 
-        info(
-            f"  Protein provenance TSV: "
-            f"{final_root / METADATA_DIR / 'protein_sources.tsv'}"
+        provenance_tsv_path = (
+            final_root / METADATA_DIR / "protein_sources.tsv"
         )
+
+        if provenance_tsv_path.is_file():
+            info(
+                f"  Protein provenance TSV: {provenance_tsv_path}"
+            )
+        else:
+            info(
+                "  Protein provenance TSV: not generated (optional)"
+            )
 
         grouped_yaml_path = (
             final_root / METADATA_DIR / "protein_sources.yaml.gz"
@@ -19328,6 +19495,11 @@ def main(
             info(
                 "  Protein provenance YAML: not generated (optional)"
             )
+
+        info(
+            f"  Protein provenance SQLite: "
+            f"{final_root / STATE_DB_REL}"
+        )
 
         # The shell wrapper finalizes the console log after Python exits.
         console_log_name = os.environ.get("TAURIDASPROT_CONSOLE_LOG_NAME")
